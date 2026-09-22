@@ -1,0 +1,7 @@
+[package]
+name = "twitch-playlist"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+twitch-core.workspace = true

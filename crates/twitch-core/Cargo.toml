@@ -1,0 +1,6 @@
+[package]
+name = "twitch-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]

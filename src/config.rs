@@ -1,0 +1,254 @@
+//! Configuration file (`key = value` lines) and command line.
+
+use std::path::PathBuf;
+
+use twitch_auth::cookies;
+use twitch_playlist::Quality;
+
+use crate::viz::VizStyle;
+
+/// Where the session token came from, for display in the interface.
+#[derive(Clone, PartialEq, Eq)]
+pub enum TokenSource {
+    Config,
+    Environment,
+    Firefox { browser: String, profile: String },
+    /// No token: the reason is shown in the help screen.
+    None(String),
+}
+
+impl TokenSource {
+    pub fn label(&self) -> String {
+        match self {
+            TokenSource::Config => "token from the config file".into(),
+            TokenSource::Environment => "token from TWITCH_TOKEN".into(),
+            TokenSource::Firefox { browser, profile } => format!("{browser} cookie ({profile})"),
+            TokenSource::None(reason) => reason.clone(),
+        }
+    }
+}
+
+/// How the picture is drawn.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum VideoOutput {
+    /// Real picture when the terminal supports it, else ASCII.
+    Auto,
+    Ascii,
+    /// Real picture, even when the terminal was not recognised.
+    Graphics,
+}
+
+pub struct Config {
+    pub token: Option<String>,
+    /// Frames per second for the picture.
+    pub video_fps: u32,
+    pub video_output: VideoOutput,
+    pub video_quality: Quality,
+    pub token_source: TokenSource,
+    pub volume: u32,
+    pub visualizer: VizStyle,
+    pub autoplay: Option<String>,
+}
+
+const TEMPLATE: &str = "\
+# twitch-tui configuration
+#
+# Logging in (followed channels, chat, follow/unfollow) is automatic: the
+# app reads the Twitch session cookie of your Firefox profile. Just stay
+# logged in on twitch.tv in Firefox.
+#
+# Set this to false to never read the browser cookies.
+# firefox_login = true
+#
+# Only look in this profile instead of searching for one.
+# firefox_profile = ~/.mozilla/firefox/xxxxxxxx.default-release
+#
+# Token to use instead of the browser cookie (the `auth-token` cookie value).
+# Keep this file private.
+# token = your_auth_token
+
+# Initial volume, 0-150.
+volume = 80
+
+# Frames per second of the picture, 5 to 60. Lower it on a slow terminal
+# or over SSH: each ASCII frame repaints the whole panel.
+video_fps = 30
+
+# How the picture is drawn: auto (real picture in kitty or Ghostty, ASCII
+# elsewhere), ascii, or graphics (force the kitty graphics protocol).
+# The `a` key switches between the two while running.
+video_output = auto
+
+# Rendition of the stream to decode: auto (480p, plenty for a terminal), a
+# height such as 360p, 720p or 1080p (the tallest one up to it), or source.
+# Taller costs more CPU and bandwidth. The `c` key cycles through them.
+video_quality = auto
+
+# Visualizer style: spectrum, mirror, scope or video (the stream picture).
+visualizer = spectrum
+";
+
+pub fn path() -> PathBuf {
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
+        .unwrap_or_else(|| PathBuf::from("."));
+    base.join("twitch-tui").join("config")
+}
+
+/// Writes the commented template on first run, readable by the user only.
+fn create_template(path: &std::path::Path) {
+    use std::os::unix::fs::OpenOptionsExt;
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let file = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(path);
+    if let Ok(mut file) = file {
+        use std::io::Write;
+        let _ = file.write_all(TEMPLATE.as_bytes());
+    }
+}
+
+pub fn load(args: &[String]) -> Result<Config, String> {
+    let mut config = Config {
+        token: None,
+        video_fps: video::DEFAULT_FPS,
+        video_output: VideoOutput::Auto,
+        video_quality: Quality::Auto,
+        token_source: TokenSource::None(String::new()),
+        volume: 80,
+        visualizer: VizStyle::Bars,
+        autoplay: None,
+    };
+    let mut firefox_login = true;
+    let mut firefox_profile: Option<PathBuf> = None;
+    let mut anonymous = false;
+
+    let path = path();
+    match std::fs::read_to_string(&path) {
+        Ok(text) => {
+            for (n, line) in text.lines().enumerate() {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
+                }
+                let (key, value) = line
+                    .split_once('=')
+                    .ok_or_else(|| format!("{}:{}: expected `key = value`", path.display(), n + 1))?;
+                let value = value.trim().trim_matches('"');
+                match key.trim() {
+                    "token" => config.token = Some(value.to_string()).filter(|v| !v.is_empty()),
+                    "volume" => config.volume = value.parse().map_err(|_| format!("invalid volume: {value}"))?,
+                    "visualizer" => config.visualizer = parse_viz(value)?,
+                    "video_fps" => {
+                        let fps: u32 = value.parse().map_err(|_| format!("invalid video_fps: {value}"))?;
+                        config.video_fps = fps.clamp(5, 60);
+                    }
+                    "video_output" => {
+                        config.video_output = match value {
+                            "auto" => VideoOutput::Auto,
+                            "ascii" => VideoOutput::Ascii,
+                            "graphics" | "kitty" => VideoOutput::Graphics,
+                            _ => return Err(format!("unknown video_output `{value}` (auto, ascii, graphics)")),
+                        }
+                    }
+                    "video_quality" => {
+                        config.video_quality = Quality::parse(value).ok_or_else(|| {
+                            format!("unknown video_quality `{value}` (auto, 360p, 720p, 1080p, source…)")
+                        })?
+                    }
+                    "firefox_login" => firefox_login = value != "false",
+                    "firefox_profile" => firefox_profile = Some(expand_home(value)),
+                    other => return Err(format!("{}:{}: unknown key `{other}`", path.display(), n + 1)),
+                }
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => create_template(&path),
+        Err(e) => return Err(format!("cannot read {}: {e}", path.display())),
+    }
+
+    if config.token.is_some() {
+        config.token_source = TokenSource::Config;
+    }
+    if let Some(token) = std::env::var("TWITCH_TOKEN").ok().filter(|t| !t.trim().is_empty()) {
+        config.token = Some(token);
+        config.token_source = TokenSource::Environment;
+    }
+
+    let mut iter = args.iter().skip(1);
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "-v" | "--volume" => {
+                let v = iter.next().ok_or("--volume needs a value")?;
+                config.volume = v.parse().map_err(|_| format!("invalid volume: {v}"))?;
+            }
+            "--anonymous" => anonymous = true,
+            "--check-login" => {}
+            "--profile" => {
+                let path = iter.next().ok_or("--profile needs a directory")?;
+                firefox_profile = Some(expand_home(path));
+            }
+            a if a.starts_with('-') => return Err(format!("unknown option {a} (see --help)")),
+            channel => {
+                let channel = channel.rsplit('/').next().unwrap_or(channel);
+                config.autoplay = Some(channel.to_string());
+            }
+        }
+    }
+    config.volume = config.volume.min(150);
+
+    // Without an explicit token, log in with the browser's Twitch cookie.
+    if anonymous {
+        config.token = None;
+        config.token_source = TokenSource::None("started with --anonymous".into());
+    } else if config.token.is_none() {
+        if firefox_login {
+            match cookies::find_token(firefox_profile.as_deref()) {
+                Ok(found) => {
+                    config.token = Some(found.token);
+                    config.token_source =
+                        TokenSource::Firefox { browser: found.browser.to_string(), profile: found.profile };
+                }
+                Err(reason) => config.token_source = TokenSource::None(reason),
+            }
+        } else {
+            config.token_source = TokenSource::None("firefox_login is off in the config file".into());
+        }
+    }
+    Ok(config)
+}
+
+fn expand_home(value: &str) -> PathBuf {
+    match value.strip_prefix("~/") {
+        Some(rest) => std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default().join(rest),
+        None => PathBuf::from(value),
+    }
+}
+
+fn parse_viz(value: &str) -> Result<VizStyle, String> {
+    match value {
+        "spectrum" | "bars" => Ok(VizStyle::Bars),
+        "mirror" => Ok(VizStyle::Mirror),
+        "scope" | "wave" => Ok(VizStyle::Wave),
+        "video" | "ascii" => Ok(VizStyle::Video),
+        _ => Err(format!("unknown visualizer `{value}` (spectrum, mirror, scope, video)")),
+    }
+}
+
+pub fn usage() -> String {
+    format!(
+        "twitch-tui: listen to Twitch streams (audio only) and chat from your terminal\n\n\
+         USAGE:\n    twitch-tui [OPTIONS] [CHANNEL]\n\n\
+         ARGS:\n    CHANNEL            channel login or URL to start playing\n\n\
+         OPTIONS:\n    -v, --volume N     initial volume (0-150)\n        \
+         --profile DIR  Firefox profile to read the Twitch cookie from\n        \
+         --anonymous    log in with nobody's account\n        \
+         --check-login  report where the token comes from and exit\n    \
+         -h, --help         show this help\n\n\
+         LOGIN:\n    Automatic: the Twitch cookie of your Firefox profile is used.\n\n\
+         CONFIG:\n    {}\n    TWITCH_TOKEN environment variable overrides the token\n\n\
+         REQUIRES:\n    curl, ffmpeg and one of pw-cat / pacat / aplay\n",
+        path().display()
+    )
+}

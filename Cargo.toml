@@ -1,0 +1,35 @@
+[workspace]
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+
+[workspace.dependencies]
+audio = { path = "crates/audio" }
+term = { path = "crates/term" }
+twitch-core = { path = "crates/twitch-core" }
+twitch-auth = { path = "crates/twitch-auth" }
+twitch-channels = { path = "crates/twitch-channels" }
+twitch-chat = { path = "crates/twitch-chat" }
+twitch-playlist = { path = "crates/twitch-playlist" }
+video = { path = "crates/video" }
+
+[package]
+name = "twitch-tui"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+audio.workspace = true
+term.workspace = true
+twitch-core.workspace = true
+twitch-auth.workspace = true
+twitch-channels.workspace = true
+twitch-chat.workspace = true
+twitch-playlist.workspace = true
+video.workspace = true
+
+[profile.release]
+lto = true
+strip = true
