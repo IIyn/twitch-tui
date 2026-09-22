@@ -59,3 +59,6 @@ dependencies = [
 [[package]]
 name = "video"
 version = "0.1.0"
+dependencies = [
+ "audio",
+]

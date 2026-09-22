@@ -544,7 +544,12 @@ fn draw_now_playing(s: &mut Screen, app: &App, r: Rect, frame: u64) {
             Playback::Resolving => (format!("{} Resolving stream…", spinner(frame)), YELLOW),
             Playback::Buffering => (format!("{} Buffering…", spinner(frame)), YELLOW),
             Playback::Playing(since) => (
-                format!("▶ Playing  {}  · audio only via {}", util::duration(since.elapsed().as_secs() as i64), app.audio.backend()),
+                format!(
+                    "▶ Playing  {}  · {} via {}",
+                    util::duration(since.elapsed().as_secs() as i64),
+                    if app.audio_from_video { "sound synced to video" } else { "audio only" },
+                    app.audio.backend()
+                ),
                 GREEN,
             ),
             Playback::Paused => ("⏸ Paused, press space to resume".to_string(), MUTED),

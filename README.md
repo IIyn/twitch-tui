@@ -22,7 +22,9 @@ an audio player).
   picture.
 - **Video** in the terminal, either as a real picture (terminals supporting the
   kitty graphics protocol) or as coloured ASCII everywhere else. The quality is
-  adjustable (auto, 360p, 720p, 1080p, source).
+  adjustable (auto, 360p, 720p, 1080p, source). While the picture is shown,
+  the sound is decoded from the same rendition and the frames follow it, so
+  they stay in sync.
 - **Live chat**: badges, user colours, `/me` actions, removal of moderated
   messages. Sending messages requires being logged in.
 - **Open the channel in the browser**, in particular to follow or unfollow it
@@ -265,7 +267,7 @@ crates/
   twitch-playlist/  HLS playlist of a live stream, quality selection
   twitch-chat/      IRC chat
   audio/            ffmpeg to PCM, output through pw-cat / pacat / aplay
-  video/            ffmpeg to RGB frames sized to the panel
+  video/            ffmpeg to RGB frames sized to the panel, plus synced PCM
   term/             terminal: raw mode, double-buffered screen, keyboard
 src/
   main.rs           main loop and events
@@ -278,8 +280,8 @@ src/
 ```
 
 Dependencies only go one way: `twitch-auth`, `twitch-channels`,
-`twitch-playlist` and `twitch-chat` depend on `twitch-core`; `audio`, `video`
-and `term` depend on nothing; no crate depends on the binary. The workers
+`twitch-playlist` and `twitch-chat` depend on `twitch-core`; `video` depends on
+`audio` (for its PCM format); `audio` and `term` depend on nothing; no crate depends on the binary. The workers
 (chat, audio, video) report back through an `mpsc::Sender` of the
 application's event type.
 

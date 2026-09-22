@@ -2,16 +2,35 @@
 //! RGB frames sized to the panel. They are drawn either as coloured ASCII, or
 //! as a real picture through the kitty graphics protocol (by the application).
 //!
+//! The same ffmpeg also decodes the sound, on a second pipe handed to the
+//! audio player: both come from one rendition and one timeline, and each
+//! frame is released only once the sound has reached it, so they stay in sync.
+//!
 //! Events go back through an `mpsc::Sender` of the caller's own type, which
 //! only has to be buildable from this crate's events.
 
-use std::io::Read;
-use std::process::{Child, Command, Stdio};
+use std::io::{self, PipeReader, Read};
+use std::os::fd::AsRawFd;
+use std::os::raw::c_int;
+use std::os::unix::process::CommandExt;
+use std::process::{Child, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
 
+unsafe extern "C" {
+    fn fcntl(fd: c_int, cmd: c_int, ...) -> c_int;
+}
+const F_SETFD: c_int = 2;
+const F_SETPIPE_SZ: c_int = 1031;
+/// Room for decoded frames waiting for the sound to catch up, so ffmpeg can
+/// keep feeding the audio meanwhile.
+const FRAME_PIPE: c_int = 1 << 20;
+/// A frame waits for the sound only while the sound moves: if it stalls this
+/// long, ffmpeg may be blocked on us and the frame goes out anyway.
+const STALL: Duration = Duration::from_millis(150);
 
 /// Frames per second when the config does not say otherwise.
 pub const DEFAULT_FPS: u32 = 30;
@@ -52,6 +71,15 @@ impl Target {
 /// Sent when the decoder stops on its own, with the reason.
 pub enum VideoEvent {
     Stopped(String),
+}
+
+/// The sound of a running decoder, for the audio player.
+pub struct Feed {
+    /// PCM in the `audio::PCM_ARGS` format.
+    pub pcm: PipeReader,
+    /// Where the player stores the stream time being heard, in microseconds,
+    /// which paces the pictures.
+    pub heard: Arc<AtomicU64>,
 }
 
 pub struct Frame {
@@ -147,26 +175,35 @@ impl Video {
         self.frame.lock().ok()?.as_ref().map(f)
     }
 
-    pub fn start<E: From<VideoEvent> + Send + 'static>(&mut self, url: &str, target: Target, tx: Sender<E>) {
+    /// Starts decoding `url`, returning its sound, which must be played for
+    /// the pictures to move on.
+    pub fn start<E: From<VideoEvent> + Send + 'static>(&mut self, url: &str, target: Target, tx: Sender<E>) -> Option<Feed> {
         self.stop();
         if target.cols < 8 || target.rows < 4 {
-            return;
+            return None;
         }
         self.started = Some((url.to_string(), target));
+        let (ffmpeg, output, pcm) = match spawn(url, target, self.fps, self.background) {
+            Ok(spawned) => spawned,
+            Err(e) => {
+                let _ = tx.send(VideoEvent::Stopped(e).into());
+                return None;
+            }
+        };
         let session = Session {
             stop: Arc::new(AtomicBool::new(false)),
-            child: Arc::new(Mutex::new(None)),
+            child: Arc::new(Mutex::new(Some(ffmpeg))),
         };
         let (stop, child) = (session.stop.clone(), session.child.clone());
+        let heard = Arc::new(AtomicU64::new(0));
         let frame = self.frame.clone();
         let decoded = self.decoded.clone();
-        let url = url.to_string();
         let fps = self.fps;
-        let background = self.background;
         self.session = Some(session);
 
+        let clock = heard.clone();
         thread::spawn(move || {
-            match decode(&url, target, fps, background, &stop, &child, &frame, &decoded) {
+            match decode(output, target, fps, &clock, &stop, &frame, &decoded) {
                 Err(e) if !stop.load(Ordering::SeqCst) => {
                     let _ = tx.send(VideoEvent::Stopped(e).into());
                 }
@@ -179,6 +216,7 @@ impl Video {
                 let _ = child.wait();
             }
         });
+        Some(Feed { pcm, heard })
     }
 }
 
@@ -188,46 +226,63 @@ impl Drop for Video {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Starts ffmpeg with the frames on its stdout and the sound on a pipe of
+/// its own.
+fn spawn(url: &str, target: Target, fps: u32, [r, g, b]: [u8; 3]) -> Result<(Child, ChildStdout, PipeReader), String> {
+    let (width, height) = (target.width, target.height);
+    // Fit the picture inside the panel and pad the rest, so every frame has
+    // exactly the same size and the aspect ratio survives. Both outputs are
+    // made to start at time zero of the input (padding with repeated frames
+    // or silence) so frame `n` is due when the sound reaches `n / fps`.
+    let filter = format!(
+        "fps=fps={fps}:start_time=0,scale={width}:{height}:force_original_aspect_ratio=decrease,\
+         pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=0x{r:02x}{g:02x}{b:02x}"
+    );
+    let (pcm, pcm_writer) = io::pipe().map_err(|e| format!("cannot create audio pipe: {e}"))?;
+    let pcm_fd = pcm_writer.as_raw_fd();
+    let mut command = Command::new("ffmpeg");
+    command
+        .args(["-nostdin", "-hide_banner", "-loglevel", "error"])
+        .args(["-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "4"])
+        .args(["-i", url])
+        .args(["-map", "0:v:0", "-vf", &filter, "-pix_fmt", "rgb24", "-f", "rawvideo", "pipe:1"])
+        .args(["-map", "0:a:0", "-af", "aresample=async=1:first_pts=0"])
+        .args(audio::PCM_ARGS)
+        .arg(format!("pipe:{pcm_fd}"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    // The pipe is created close-on-exec; let this one child inherit it.
+    unsafe {
+        command.pre_exec(move || match fcntl(pcm_fd, F_SETFD, 0) {
+            -1 => Err(io::Error::last_os_error()),
+            _ => Ok(()),
+        });
+    }
+    let mut ffmpeg = command.spawn().map_err(|e| format!("cannot start ffmpeg for video: {e}"))?;
+    // Only ffmpeg may hold the writing end, so its exit reads as the end.
+    drop(pcm_writer);
+    let output = ffmpeg.stdout.take().ok_or("ffmpeg stdout unavailable")?;
+    unsafe { fcntl(output.as_raw_fd(), F_SETPIPE_SZ, FRAME_PIPE) };
+    Ok((ffmpeg, output, pcm))
+}
+
 fn decode(
-    url: &str,
+    mut output: ChildStdout,
     target: Target,
     fps: u32,
-    [r, g, b]: [u8; 3],
+    heard: &AtomicU64,
     stop: &AtomicBool,
-    child: &Mutex<Option<Child>>,
     frame: &Mutex<Option<Frame>>,
     decoded: &AtomicU64,
 ) -> Result<(), String> {
-    let (width, height) = (target.width as usize, target.height as usize);
-    // Fit the picture inside the panel and pad the rest, so every frame has
-    // exactly the same size and the aspect ratio survives.
-    let filter = format!(
-        "fps={fps},scale={width}:{height}:force_original_aspect_ratio=decrease,\
-         pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=0x{r:02x}{g:02x}{b:02x}"
-    );
-    let mut ffmpeg = Command::new("ffmpeg")
-        .args(["-nostdin", "-hide_banner", "-loglevel", "error"])
-        .args(["-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "4"])
-        // Without this ffmpeg races through whatever the server hands it, so
-        // the picture arrives in bursts: a second of fast-forward, then a
-        // freeze. Reading at the native rate keeps it steady and near live.
-        .args(["-re", "-i", url, "-an", "-vf", &filter])
-        .args(["-pix_fmt", "rgb24", "-f", "rawvideo", "pipe:1"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|e| format!("cannot start ffmpeg for video: {e}"))?;
-    let mut output = ffmpeg.stdout.take().ok_or("ffmpeg stdout unavailable")?;
-    *child.lock().unwrap() = Some(ffmpeg);
-
-    let mut buffer = vec![0u8; width * height * 3];
+    let mut buffer = vec![0u8; target.width as usize * target.height as usize * 3];
     let mut seq = 0;
     while !stop.load(Ordering::SeqCst) {
         if let Err(e) = output.read_exact(&mut buffer) {
             return Err(format!("video stream ended: {e}"));
         }
+        wait_for_sound(seq * 1_000_000 / fps as u64, heard, stop);
         seq += 1;
         if let Ok(mut frame) = frame.lock() {
             // Reuse the previous frame's allocation.
@@ -243,4 +298,23 @@ fn decode(
         decoded.fetch_add(1, Ordering::Relaxed);
     }
     Ok(())
+}
+
+/// Blocks until the sound being heard reaches `due` (microseconds), unless
+/// the sound stops moving.
+fn wait_for_sound(due: u64, heard: &AtomicU64, stop: &AtomicBool) {
+    let mut last = heard.load(Ordering::Relaxed);
+    let mut moved = Instant::now();
+    while !stop.load(Ordering::SeqCst) {
+        let now = heard.load(Ordering::Relaxed);
+        if now >= due {
+            return;
+        }
+        if now != last {
+            (last, moved) = (now, Instant::now());
+        } else if moved.elapsed() >= STALL {
+            return;
+        }
+        thread::sleep(Duration::from_micros((due - now).min(5_000)));
+    }
 }

@@ -1,6 +1,8 @@
 //! Audio pipeline: `ffmpeg` decodes the HLS stream to raw PCM on its stdout,
 //! we apply the volume, tap the samples for the visualizer and pipe them into
-//! a system player (`pw-cat`, `pacat` or `aplay`).
+//! a system player (`pw-cat`, `pacat` or `aplay`). The PCM can also come
+//! from another process (the video decoder, so sound and picture share one
+//! timeline), in which case the position being heard is published for it.
 //!
 //! Events go back through an `mpsc::Sender` of the caller's own type, which
 //! only has to be buildable from this crate's events.
@@ -10,12 +12,14 @@ use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::raw::c_int;
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
 pub const SAMPLE_RATE: u32 = 48_000;
+/// ffmpeg output options producing the PCM this crate plays.
+pub const PCM_ARGS: [&str; 6] = ["-f", "s16le", "-ac", "2", "-ar", "48000"];
 const CHANNELS: usize = 2;
 const TAP_LEN: usize = 8192;
 
@@ -23,6 +27,9 @@ unsafe extern "C" {
     fn fcntl(fd: c_int, cmd: c_int, ...) -> c_int;
 }
 const F_SETPIPE_SZ: c_int = 1031;
+/// Bytes held in the pipe to the player, kept small so what we tap (and the
+/// position we publish) stays close to what is heard.
+const SINK_PIPE: usize = 8192;
 
 /// Events carry the id given to `Audio::play` so stale ones can be ignored.
 pub enum AudioEvent {
@@ -81,6 +88,20 @@ fn player_command(backend: &str) -> Command {
     cmd
 }
 
+/// Time between a sample being written to the player and being heard: the
+/// player's own buffer plus our pipe to it.
+fn latency_us(backend: &str) -> u64 {
+    let player_ms = if backend == "aplay" { 120 } else { 60 };
+    let pipe_frames = (SINK_PIPE / (CHANNELS * 2)) as u64;
+    player_ms * 1000 + pipe_frames * 1_000_000 / SAMPLE_RATE as u64
+}
+
+/// Where the PCM comes from.
+enum Source {
+    Url(String),
+    Pipe(Box<dyn Read + Send>),
+}
+
 impl Audio {
     pub fn new(volume: u32) -> Audio {
         Audio {
@@ -110,7 +131,24 @@ impl Audio {
         }
     }
 
+    /// Decodes and plays the stream at `url`.
     pub fn play<E: From<AudioEvent> + Send + 'static>(&mut self, url: String, id: u64, tx: Sender<E>) {
+        self.start(Source::Url(url), Arc::new(AtomicU64::new(0)), id, tx);
+    }
+
+    /// Plays PCM in the `PCM_ARGS` format decoded by someone else, storing in
+    /// `heard` the stream time being heard, in microseconds from its start.
+    pub fn play_from<E: From<AudioEvent> + Send + 'static>(
+        &mut self,
+        pcm: impl Read + Send + 'static,
+        heard: Arc<AtomicU64>,
+        id: u64,
+        tx: Sender<E>,
+    ) {
+        self.start(Source::Pipe(Box::new(pcm)), heard, id, tx);
+    }
+
+    fn start<E: From<AudioEvent> + Send + 'static>(&mut self, source: Source, heard: Arc<AtomicU64>, id: u64, tx: Sender<E>) {
         self.stop();
         let Some(backend) = self.backend else {
             let _ = tx.send(
@@ -134,7 +172,7 @@ impl Audio {
         self.session = Some(session);
 
         thread::spawn(move || {
-            let result = run_pipeline(&url, id, backend, &stop, &children, &volume, &muted, &tap, &tx);
+            let result = run_pipeline(source, id, backend, &stop, &children, &volume, &muted, &tap, &heard, &tx);
             let was_stopped = stop.swap(true, Ordering::SeqCst);
             if let Ok(mut children) = children.lock() {
                 for child in children.iter_mut() {
@@ -157,7 +195,7 @@ impl Drop for Audio {
 
 #[allow(clippy::too_many_arguments)]
 fn run_pipeline<E: From<AudioEvent>>(
-    url: &str,
+    source: Source,
     id: u64,
     backend: &str,
     stop: &AtomicBool,
@@ -165,33 +203,31 @@ fn run_pipeline<E: From<AudioEvent>>(
     volume: &AtomicU32,
     muted: &AtomicBool,
     tap: &Mutex<Tap>,
+    heard: &AtomicU64,
     tx: &Sender<E>,
 ) -> Result<(), String> {
-    let mut decoder = Command::new("ffmpeg")
-        .args(["-nostdin", "-hide_banner", "-loglevel", "error"])
-        .args(["-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "4"])
-        .args(["-i", url, "-vn", "-f", "s16le", "-ac", "2", "-ar", &SAMPLE_RATE.to_string(), "pipe:1"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("cannot start ffmpeg: {e}"))?;
-    let mut pcm = decoder.stdout.take().ok_or("ffmpeg stdout unavailable")?;
-    let mut errors = decoder.stderr.take();
-    children.lock().unwrap().push(decoder);
-
-    // Collect ffmpeg's last error line for reporting.
     let last_error = Arc::new(Mutex::new(String::new()));
-    if let Some(mut stderr) = errors.take() {
-        let last_error = last_error.clone();
-        thread::spawn(move || {
-            let mut text = String::new();
-            let _ = stderr.read_to_string(&mut text);
-            if let Some(line) = text.lines().rev().find(|l| !l.trim().is_empty()) {
-                *last_error.lock().unwrap() = line.trim().to_string();
-            }
-        });
-    }
+    let mut pcm: Box<dyn Read + Send> = match source {
+        Source::Pipe(pcm) => pcm,
+        Source::Url(url) => {
+            let mut decoder = Command::new("ffmpeg")
+                .args(["-nostdin", "-hide_banner", "-loglevel", "error"])
+                .args(["-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "4"])
+                .args(["-i", &url, "-vn"])
+                .args(PCM_ARGS)
+                .arg("pipe:1")
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .map_err(|e| format!("cannot start ffmpeg: {e}"))?;
+            let pcm = decoder.stdout.take().ok_or("ffmpeg stdout unavailable")?;
+            let errors = decoder.stderr.take();
+            children.lock().unwrap().push(decoder);
+            collect_last_error(errors, &last_error);
+            Box::new(pcm)
+        }
+    };
 
     let mut player = player_command(backend)
         .stdin(Stdio::piped())
@@ -201,12 +237,14 @@ fn run_pipeline<E: From<AudioEvent>>(
         .map_err(|e| format!("cannot start {backend}: {e}"))?;
     let mut sink = player.stdin.take().ok_or("player stdin unavailable")?;
     // Keep the pipe small so the visualizer stays in sync with what we hear.
-    unsafe { fcntl(sink.as_raw_fd(), F_SETPIPE_SZ, 8192 as c_int) };
+    unsafe { fcntl(sink.as_raw_fd(), F_SETPIPE_SZ, SINK_PIPE as c_int) };
     children.lock().unwrap().push(player);
 
     let mut buf = vec![0u8; 1024 * CHANNELS * 2];
     let mut filled = 0;
     let mut started = false;
+    let mut written: u64 = 0;
+    let latency = latency_us(backend);
     while !stop.load(Ordering::SeqCst) {
         let n = pcm.read(&mut buf[filled..]).map_err(|e| format!("decoder read failed: {e}"))?;
         if n == 0 {
@@ -245,6 +283,8 @@ fn run_pipeline<E: From<AudioEvent>>(
         }
 
         sink.write_all(&buf[..usable]).map_err(|e| format!("{backend} stopped: {e}"))?;
+        written += (usable / (CHANNELS * 2)) as u64;
+        heard.store((written * 1_000_000 / SAMPLE_RATE as u64).saturating_sub(latency), Ordering::Relaxed);
         buf.copy_within(usable..filled, 0);
         filled -= usable;
 
@@ -254,4 +294,17 @@ fn run_pipeline<E: From<AudioEvent>>(
         }
     }
     Ok(())
+}
+
+/// Keeps ffmpeg's last error line, for reporting.
+fn collect_last_error(stderr: Option<impl Read + Send + 'static>, last_error: &Arc<Mutex<String>>) {
+    let Some(mut stderr) = stderr else { return };
+    let last_error = last_error.clone();
+    thread::spawn(move || {
+        let mut text = String::new();
+        let _ = stderr.read_to_string(&mut text);
+        if let Some(line) = text.lines().rev().find(|l| !l.trim().is_empty()) {
+            *last_error.lock().unwrap() = line.trim().to_string();
+        }
+    });
 }

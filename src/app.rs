@@ -153,6 +153,11 @@ pub struct App {
     my_color: Option<[u8; 3]>,
 
     pub audio: Audio,
+    /// Audio-only rendition of the current stream.
+    audio_url: Option<String>,
+    /// The sound comes from the video decoder rather than the audio-only
+    /// rendition, so it matches the picture.
+    pub audio_from_video: bool,
     pub video: Video,
     /// Renditions carrying video for the current channel, smallest first.
     renditions: Vec<Rendition>,
@@ -216,6 +221,8 @@ impl App {
             my_name: None,
             my_color: None,
             audio: Audio::new(config.volume),
+            audio_url: None,
+            audio_from_video: false,
             video: {
                 let mut video = Video::new();
                 video.fps = config.video_fps;
@@ -404,6 +411,8 @@ impl App {
         }
         self.audio.stop();
         self.video.stop();
+        self.audio_from_video = false;
+        self.audio_url = None;
         self.renditions.clear();
         self.play_id += 1;
         let id = self.play_id;
@@ -574,7 +583,9 @@ impl App {
             Event::Chat(e) => self.on_chat(e),
             Event::Audio(e) => self.on_audio(e),
             Event::Video(VideoEvent::Stopped(reason)) => {
-                self.video.stop();
+                self.back_to_audio_only();
+                // Retry later rather than switching the sound back and forth.
+                self.video_started = Instant::now() + Duration::from_secs(3);
                 if self.viz.style == VizStyle::Video {
                     self.notify(format!("Video stopped: {reason}"), Level::Error);
                 }
@@ -648,6 +659,7 @@ impl App {
             ApiEvent::StreamUrls(id, Ok(urls)) => {
                 self.playback = Playback::Buffering;
                 self.renditions = urls.video;
+                self.audio_url = Some(urls.audio.clone());
                 self.audio.play(urls.audio, id, self.tx.clone());
             }
             ApiEvent::StreamUrls(_, Err(e)) => {
@@ -743,8 +755,14 @@ impl App {
     fn on_audio(&mut self, event: AudioEvent) {
         match event {
             AudioEvent::Playing(id) if id == self.play_id => {
-                self.playback = Playback::Playing(Instant::now());
+                // Keep counting from the first start when the source switches.
+                if !matches!(self.playback, Playback::Playing(_)) {
+                    self.playback = Playback::Playing(Instant::now());
+                }
             }
+            // The video decoder died, taking the sound with it: its own event
+            // reports why, the stream goes on from the audio-only rendition.
+            AudioEvent::Stopped(id, _) if id == self.play_id && self.audio_from_video => self.back_to_audio_only(),
             AudioEvent::Stopped(id, err) if id == self.play_id => {
                 self.playback = match err {
                     Some(e) if e != "stream ended" => {
@@ -790,7 +808,7 @@ impl App {
         let wanted = self.viz.style == VizStyle::Video
             && matches!(self.playback, Playback::Playing(_) | Playback::Buffering);
         if !wanted {
-            self.video.stop();
+            self.back_to_audio_only();
             return;
         }
         // Measure the rate actually achieved, over a short window.
@@ -812,8 +830,31 @@ impl App {
         // Debounced, so dragging the window does not restart ffmpeg per frame.
         if restart && self.video_started.elapsed() >= Duration::from_millis(500) {
             self.video_started = Instant::now();
-            self.video.start(&url, target, self.tx.clone());
+            // Stopped first, so the old decoder's end is not taken for the
+            // stream's.
+            self.audio.stop();
+            match self.video.start(&url, target, self.tx.clone()) {
+                Some(feed) => {
+                    self.audio.play_from(feed.pcm, feed.heard, self.play_id, self.tx.clone());
+                    self.audio_from_video = true;
+                }
+                None => self.back_to_audio_only(),
+            }
         }
+    }
+
+    /// Stops the picture and, if the sound came with it, plays the audio-only
+    /// rendition again.
+    fn back_to_audio_only(&mut self) {
+        let was_feeding = std::mem::take(&mut self.audio_from_video);
+        if was_feeding && matches!(self.playback, Playback::Playing(_) | Playback::Buffering)
+            && let Some(url) = self.audio_url.clone()
+        {
+            // Before stopping the video, so its end is not reported as the
+            // stream's.
+            self.audio.play(url, self.play_id, self.tx.clone());
+        }
+        self.video.stop();
     }
 
     // ------------------------------------------------------------ keys
