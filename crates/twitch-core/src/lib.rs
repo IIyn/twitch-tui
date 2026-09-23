@@ -1,7 +1,8 @@
-//! What every Twitch feature shares: the HTTP and JSON plumbing and the
-//! GraphQL client used by the twitch.tv website.
+//! What every Twitch feature shares: the HTTP and JSON plumbing, the GraphQL
+//! client used by the twitch.tv website and the public API client.
 
 pub mod gql;
+pub mod helix;
 pub mod http;
 pub mod json;
 

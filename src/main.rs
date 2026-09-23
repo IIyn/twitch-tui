@@ -58,11 +58,18 @@ fn main() {
             std::process::exit(2);
         }
     };
+    if args.iter().any(|a| a == "--login") {
+        std::process::exit(login());
+    }
+    if args.iter().any(|a| a == "--logout") {
+        std::process::exit(logout(&config));
+    }
     if args.iter().any(|a| a == "--check-login") {
         check_login(&config);
         return;
     }
-    let missing: Vec<&str> = ["curl", "ffmpeg"].into_iter().filter(|b| !in_path(b)).collect();
+    let required: &[&str] = if config.channels_only { &["curl"] } else { &["curl", "ffmpeg"] };
+    let missing: Vec<&str> = required.iter().copied().filter(|b| !in_path(b)).collect();
     if !missing.is_empty() {
         eprintln!("twitch-tui: missing required programs: {}", missing.join(", "));
         std::process::exit(1);
@@ -88,18 +95,78 @@ fn main() {
     term::leave();
 }
 
-/// Prints where the session token comes from and which account it opens.
-/// The token itself is never printed.
-fn check_login(config: &config::Config) {
-    println!("source: {}", config.token_source.label());
-    let Some(token) = &config.token else {
-        println!("result: not logged in");
-        return;
+/// Logs in to a Twitch account with the device flow and saves the session.
+fn login() -> i32 {
+    let result = twitch_auth::session::login(|code| {
+        println!("To log in, open this page and approve the code {}:", code.user_code);
+        println!("  {}", code.verification_uri);
+        let graphical = ["DISPLAY", "WAYLAND_DISPLAY"].iter().any(|v| std::env::var_os(v).is_some());
+        if graphical {
+            let _ = std::process::Command::new("xdg-open")
+                .arg(&code.verification_uri)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn();
+        }
+        println!("Waiting for approval…");
+    });
+    let saved = result.and_then(|session| twitch_auth::session::save(&session).map(|_| session));
+    match saved {
+        Ok(session) => {
+            println!("Logged in as {}.", session.login);
+            0
+        }
+        Err(e) => {
+            eprintln!("twitch-tui: login failed: {e}");
+            1
+        }
+    }
+}
+
+fn logout(config: &config::Config) -> i32 {
+    let Some(session) = &config.session else {
+        println!("Not logged in.");
+        return 0;
     };
-    println!("token:  found, {} characters", token.chars().count());
-    match twitch_auth::me(&twitch_core::Api::new(Some(token.clone()))) {
-        Ok(me) => println!("result: logged in as {} (id {})", me.display_name, me.id),
-        Err(e) => println!("result: rejected by Twitch: {e}"),
+    match twitch_auth::session::logout(session) {
+        Ok(()) => {
+            println!("Logged out of {}.", session.login);
+            0
+        }
+        Err(e) => {
+            // The session is forgotten here even when Twitch could not be told.
+            eprintln!("twitch-tui: logged out, but Twitch did not revoke the token: {e}");
+            1
+        }
+    }
+}
+
+/// Prints which account the session opens and where the website token comes
+/// from. Tokens themselves are never printed.
+fn check_login(config: &config::Config) {
+    match &config.session {
+        Some(session) => {
+            let api = twitch_core::Api::new(None).with_helix(twitch_core::helix::Helix::new(
+                session.clone(),
+                |s| {
+                    let _ = twitch_auth::session::save(s);
+                },
+            ));
+            match twitch_auth::me(&api) {
+                Ok(me) => println!("account: logged in as {} (id {})", me.display_name, me.id),
+                Err(e) => println!("account: rejected by Twitch: {e}"),
+            }
+        }
+        None => println!("account: not logged in (run twitch-tui --login)"),
+    }
+    println!("website token: {}", config.token_source.label());
+    let Some(token) = &config.token else { return };
+    match twitch_core::Api::new(Some(token.clone())).gql("query { currentUser { login } }", "{}") {
+        Ok(data) => match data.at(&["currentUser", "login"]).as_str() {
+            Some(login) => println!("website token: works, belongs to {login}"),
+            None => println!("website token: invalid or expired"),
+        },
+        Err(e) => println!("website token: rejected by Twitch: {e}"),
     }
 }
 

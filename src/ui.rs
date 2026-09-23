@@ -28,6 +28,16 @@ pub struct Layout {
 impl Layout {
     pub fn compute(w: u16, h: u16, app: &App) -> Layout {
         let body = Rect::new(0, 1, w, h.saturating_sub(2));
+        if app.channels_only {
+            return Layout {
+                header: Rect::new(0, 0, w, 1),
+                sidebar: Some(body),
+                now: None,
+                viz: None,
+                chat: None,
+                footer: Rect::new(0, h.saturating_sub(1), w, 1),
+            };
+        }
         if app.zoom {
             return Layout {
                 header: Rect::new(0, 0, w, 1),
@@ -217,7 +227,7 @@ fn draw_header(s: &mut Screen, app: &App, r: Rect) {
     let x = right_align(s, r, r.y, &label, bar.fg(color));
     s.print(x, r.y, dot, bar.fg(color).bold(), 1);
 
-    let tagline = "  audio-only twitch";
+    let tagline = if app.channels_only { "  channels only" } else { "  audio-only twitch" };
     if logo_end + str_width(tagline) as u16 + 2 < x {
         s.print(logo_end, r.y, tagline, bar.fg(FAINT).italic(), x - logo_end);
     }
@@ -228,6 +238,16 @@ fn draw_footer(s: &mut Screen, app: &App, r: Rect) {
     s.fill(r, bar);
 
     let hints: &[(&str, &str)] = match (app.typing, app.focus) {
+        (None, _) if app.channels_only => &[
+            ("↑↓", "move"),
+            ("⏎", "open in browser"),
+            ("/", "filter"),
+            ("s", "search"),
+            ("1 2", "tabs"),
+            ("r", "refresh"),
+            ("?", "help"),
+            ("q", "quit"),
+        ],
         (Some(Typing::Chat), _) => &[("⏎", "send"), ("↑↓", "history"), ("esc", "done"), ("/me", "action")],
         (Some(Typing::Search), _) => &[("⏎", "search"), ("↓", "results"), ("esc", "done")],
         (Some(Typing::Filter), _) => &[("⏎", "done"), ("esc", "done"), ("", "type to filter")],
@@ -368,19 +388,6 @@ fn draw_sidebar(s: &mut Screen, app: &App, r: Rect, frame: u64) {
             s.print(list.x, list.y + i as u16, line, theme::panel().fg(color).italic(), list.w);
         }
         return;
-    }
-
-    // Twitch hands third-party clients only the newest and oldest follows.
-    let note = app.tab == Tab::Following && app.following_capped && list.h >= 6;
-    let list = if note { Rect::new(list.x, list.y, list.w, list.h - 2) } else { list };
-    if note {
-        let text = format!(
-            "Twitch shares only {} of your follows — s to search",
-            twitch_channels::FOLLOWS_LIMIT * 2
-        );
-        for (i, line) in wrap_plain(&text, list.w as usize).iter().take(2).enumerate() {
-            s.print(list.x, list.bottom() + i as u16, line, theme::panel().fg(FAINT).italic(), list.w);
-        }
     }
 
     let per_page = (list.h / 2).max(1) as usize;
@@ -914,26 +921,38 @@ fn draw_help(s: &mut Screen, app: &App) {
     let inner = panel(s, r, title, right, true);
     let base = theme::panel();
 
-    let keys: &[(&str, &str)] = &[
-        ("tab", "switch channels / chat"),
-        ("1  2", "following / search tab"),
-        ("↑↓ jk", "move / scroll chat"),
-        ("⏎", "play selected channel"),
-        ("/", "filter following / search"),
-        ("s", "search Twitch channels"),
-        ("i", "write in chat"),
-        ("space", "pause / resume audio"),
-        ("+  -", "volume up / down"),
-        ("m", "mute"),
-        ("v", "spectrum / mirror / scope / video"),
-        ("a", "video: real picture / ASCII"),
-        ("c", "video quality"),
-        ("z", "zoom the picture to the window"),
-        ("f", "follow / unfollow channel"),
-        ("o", "open channel in browser"),
-        ("r", "refresh"),
-        ("q", "quit"),
-    ];
+    let keys: &[(&str, &str)] = if app.channels_only {
+        &[
+            ("1  2", "following / search tab"),
+            ("↑↓ jk", "move"),
+            ("⏎  o", "open channel in browser"),
+            ("/", "filter following / search"),
+            ("s", "search Twitch channels"),
+            ("r", "refresh"),
+            ("q", "quit"),
+        ]
+    } else {
+        &[
+            ("tab", "switch channels / chat"),
+            ("1  2", "following / search tab"),
+            ("↑↓ jk", "move / scroll chat"),
+            ("⏎", "play selected channel"),
+            ("/", "filter following / search"),
+            ("s", "search Twitch channels"),
+            ("i", "write in chat"),
+            ("space", "pause / resume audio"),
+            ("+  -", "volume up / down"),
+            ("m", "mute"),
+            ("v", "spectrum / mirror / scope / video"),
+            ("a", "video: real picture / ASCII"),
+            ("c", "video quality"),
+            ("z", "zoom the picture to the window"),
+            ("f", "follow / unfollow channel"),
+            ("o", "open channel in browser"),
+            ("r", "refresh"),
+            ("q", "quit"),
+        ]
+    };
     let col_w = inner.w / 2;
     let rows = keys.len().div_ceil(2);
     for (i, (key, desc)) in keys.iter().enumerate() {
@@ -948,10 +967,10 @@ fn draw_help(s: &mut Screen, app: &App) {
 
     let mut y = inner.y + rows as u16 + 2;
     let logged_in = match &app.auth {
-        Auth::LoggedIn(me) => format!("Logged in as {} — {}.", me.display_name, app.token_source.label()),
+        Auth::LoggedIn(me) => format!("Logged in as {}.", me.display_name),
         Auth::Checking => "Logging in…".to_string(),
-        Auth::Failed(e) => format!("Login failed ({}): {e}", app.token_source.label()),
-        Auth::Anonymous => format!("Not logged in: {}.", app.token_source.label()),
+        Auth::Failed(e) => format!("Login failed: {e}"),
+        Auth::Anonymous => "Not logged in.".to_string(),
     };
     let setup: Vec<(String, Style)> = vec![
         ("Logging in".into(), base.fg(TEXT).bold()),
@@ -959,15 +978,18 @@ fn draw_help(s: &mut Screen, app: &App) {
         (logged_in, base.fg(if app.me().is_some() { GREEN } else { YELLOW })),
         (String::new(), base),
         (
-            "The app logs in by itself with the Twitch cookie of your Firefox profile: just stay \
-             logged in on twitch.tv in Firefox and restart the app. LibreWolf, Zen, Floorp and \
-             Waterfox work too."
+            "Quit and run `twitch-tui --login`, then approve the code it shows on twitch.tv. \
+             This gives your followed channels and lets you write in chat."
                 .into(),
             base.fg(MUTED),
         ),
         (String::new(), base),
+        (format!("Website token: {}.", app.token_source.label()), base.fg(MUTED)),
         (
-            "You can also set a token by hand, or turn the cookie lookup off, in:".into(),
+            "Optional: read from your Firefox profile (LibreWolf, Zen, Floorp and Waterfox work \
+             too), it brings your subscriber perks to playback. It can be set by hand, or its \
+             lookup turned off, in:"
+                .into(),
             base.fg(MUTED),
         ),
         (format!("  {}", crate::config::path().display()), base.fg(YELLOW)),
@@ -975,11 +997,9 @@ fn draw_help(s: &mut Screen, app: &App) {
         ("What Twitch does not allow".into(), base.fg(TEXT).bold()),
         (String::new(), base),
         (
-            format!(
-                "Outside its own site Twitch shares only your {} newest and {0} oldest follows, \
-                 and refuses follow/unfollow: press o to do that in the browser.",
-                twitch_channels::FOLLOWS_LIMIT
-            ),
+            "Following and unfollowing is reserved to Twitch's own site: press o to do it in the \
+             browser."
+                .into(),
             base.fg(MUTED),
         ),
     ];

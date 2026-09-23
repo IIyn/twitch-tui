@@ -1,7 +1,8 @@
-//! Logging in: the session token lifted from Firefox's cookies, and the
-//! account it opens.
+//! Logging in: the Twitch account session (device flow), the website token
+//! lifted from Firefox's cookies, and the account the session opens.
 
 pub mod cookies;
+pub mod session;
 mod sqlite;
 
 use twitch_core::Api;
@@ -13,15 +14,14 @@ pub struct Me {
     pub display_name: String,
 }
 
-/// The account the token opens.
+/// The account the session opens.
 pub fn me(api: &Api) -> Result<Me, String> {
-    api.require_login()?;
-    let data = api.gql("query { currentUser { id login displayName } }", "{}")?;
-    let user = data.get("currentUser");
-    let login = user.get("login").as_str().ok_or("token is invalid or expired")?;
+    let doc = api.helix()?.get("/users")?;
+    let user = doc.get("data").as_array().first().ok_or("Twitch did not say who is logged in")?;
+    let login = user.get("login").as_str().ok_or("Twitch did not say who is logged in")?;
     Ok(Me {
         id: user.get("id").str_or("").to_string(),
         login: login.to_string(),
-        display_name: user.get("displayName").str_or(login).to_string(),
+        display_name: user.get("display_name").str_or(login).to_string(),
     })
 }

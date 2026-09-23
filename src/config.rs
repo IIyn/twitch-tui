@@ -2,12 +2,13 @@
 
 use std::path::PathBuf;
 
-use twitch_auth::cookies;
+use twitch_auth::{cookies, session};
+use twitch_core::helix::Session;
 use twitch_playlist::Quality;
 
 use crate::viz::VizStyle;
 
-/// Where the session token came from, for display in the interface.
+/// Where the website token came from, for display in the interface.
 #[derive(Clone, PartialEq, Eq)]
 pub enum TokenSource {
     Config,
@@ -39,6 +40,10 @@ pub enum VideoOutput {
 }
 
 pub struct Config {
+    /// The Twitch account, from `--login`.
+    pub session: Option<Session>,
+    /// The twitch.tv website's own token: optional, it only brings the
+    /// account's subscriber perks to playback and lets follow be attempted.
     pub token: Option<String>,
     /// Frames per second for the picture.
     pub video_fps: u32,
@@ -48,14 +53,20 @@ pub struct Config {
     pub volume: u32,
     pub visualizer: VizStyle,
     pub autoplay: Option<String>,
+    /// Only the channel lists: no playback nor chat.
+    pub channels_only: bool,
 }
 
 const TEMPLATE: &str = "\
 # twitch-tui configuration
 #
-# Logging in (followed channels, chat, follow/unfollow) is automatic: the
-# app reads the Twitch session cookie of your Firefox profile. Just stay
-# logged in on twitch.tv in Firefox.
+# Log in to your Twitch account (followed channels, chat) by running
+# `twitch-tui --login` once.
+#
+# Besides that, the app reads the twitch.tv session cookie of your Firefox
+# profile when it finds one. It is optional: it brings your subscriber
+# perks (no ads, subscriber-only streams) to playback, and lets the app
+# try to follow/unfollow channels.
 #
 # Set this to false to never read the browser cookies.
 # firefox_login = true
@@ -112,6 +123,7 @@ fn create_template(path: &std::path::Path) {
 
 pub fn load(args: &[String]) -> Result<Config, String> {
     let mut config = Config {
+        session: None,
         token: None,
         video_fps: video::DEFAULT_FPS,
         video_output: VideoOutput::Auto,
@@ -120,6 +132,7 @@ pub fn load(args: &[String]) -> Result<Config, String> {
         volume: 80,
         visualizer: VizStyle::Bars,
         autoplay: None,
+        channels_only: false,
     };
     let mut firefox_login = true;
     let mut firefox_profile: Option<PathBuf> = None;
@@ -184,7 +197,8 @@ pub fn load(args: &[String]) -> Result<Config, String> {
                 config.volume = v.parse().map_err(|_| format!("invalid volume: {v}"))?;
             }
             "--anonymous" => anonymous = true,
-            "--check-login" => {}
+            "--channels-only" | "--compatibility" => config.channels_only = true,
+            "--check-login" | "--login" | "--logout" => {}
             "--profile" => {
                 let path = iter.next().ok_or("--profile needs a directory")?;
                 firefox_profile = Some(expand_home(path));
@@ -197,8 +211,11 @@ pub fn load(args: &[String]) -> Result<Config, String> {
         }
     }
     config.volume = config.volume.min(150);
+    if !anonymous {
+        config.session = session::load();
+    }
 
-    // Without an explicit token, log in with the browser's Twitch cookie.
+    // Without an explicit token, use the browser's Twitch cookie.
     if anonymous {
         config.token = None;
         config.token_source = TokenSource::None("started with --anonymous".into());
@@ -242,13 +259,21 @@ pub fn usage() -> String {
          USAGE:\n    twitch-tui [OPTIONS] [CHANNEL]\n\n\
          ARGS:\n    CHANNEL            channel login or URL to start playing\n\n\
          OPTIONS:\n    -v, --volume N     initial volume (0-150)\n        \
+         --login        log in to your Twitch account and exit\n        \
+         --logout       log out of your Twitch account and exit\n        \
          --profile DIR  Firefox profile to read the Twitch cookie from\n        \
-         --anonymous    log in with nobody's account\n        \
-         --check-login  report where the token comes from and exit\n    \
+         --anonymous    start logged out\n        \
+         --channels-only  only the followed channels and search, no playback\n                       \
+         nor chat (alias: --compatibility)\n        \
+         --check-login  report the account and the website token, then exit\n    \
          -h, --help         show this help\n\n\
-         LOGIN:\n    Automatic: the Twitch cookie of your Firefox profile is used.\n\n\
-         CONFIG:\n    {}\n    TWITCH_TOKEN environment variable overrides the token\n\n\
+         LOGIN:\n    Run `twitch-tui --login` once and approve the code on twitch.tv.\n    \
+         The Twitch cookie of your Firefox profile, when found, adds your\n    \
+         subscriber perks to playback.\n\n\
+         SESSION:\n    {}\n\n\
+         CONFIG:\n    {}\n    TWITCH_TOKEN environment variable overrides the website token\n\n\
          REQUIRES:\n    curl, ffmpeg and one of pw-cat / pacat / aplay\n",
+        session::path().display(),
         path().display()
     )
 }

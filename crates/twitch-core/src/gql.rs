@@ -1,15 +1,21 @@
 //! Twitch GraphQL API (the one used by the twitch.tv website).
 
+use std::sync::Arc;
+
+use crate::helix::Helix;
 use crate::http;
 use crate::json::{self, Json, quote};
 
 pub const CLIENT_ID: &str = "kimne78kx3ncx6brgo4mv6wki5h1ko";
 const GQL_URL: &str = "https://gql.twitch.tv/gql";
 
+/// Both ways into Twitch: the website's GraphQL API, anonymous or with the
+/// website's session token, and the public API with the account's session.
 #[derive(Clone)]
 pub struct Api {
     token: Option<String>,
     device_id: String,
+    helix: Option<Arc<Helix>>,
 }
 
 impl Api {
@@ -17,7 +23,26 @@ impl Api {
         let token = token
             .map(|t| t.trim().trim_start_matches("oauth:").to_string())
             .filter(|t| !t.is_empty());
-        Api { token, device_id: random_hex(16) }
+        Api { token, device_id: random_hex(16), helix: None }
+    }
+
+    pub fn with_helix(mut self, helix: Helix) -> Self {
+        self.helix = Some(Arc::new(helix));
+        self
+    }
+
+    /// The same, logged out of the account (the website token stays).
+    pub fn without_helix(&self) -> Self {
+        Api { helix: None, ..self.clone() }
+    }
+
+    /// The account's public API client, if logged in.
+    pub fn helix(&self) -> Result<&Helix, String> {
+        self.helix.as_deref().ok_or_else(|| "not logged in: run twitch-tui --login".to_string())
+    }
+
+    pub fn logged_in(&self) -> bool {
+        self.helix.is_some()
     }
 
     pub fn token(&self) -> Option<&str> {
@@ -79,13 +104,6 @@ impl Api {
 
     pub fn gql(&self, query: &str, variables: &str) -> Result<Json, String> {
         self.gql_raw(query, variables, None).map_err(|e| e.to_string())
-    }
-
-    pub fn require_login(&self) -> Result<(), String> {
-        match self.token {
-            Some(_) => Ok(()),
-            None => Err("not logged in: add your token to the config file".into()),
-        }
     }
 
     pub fn integrity_token(&self) -> Result<String, String> {

@@ -5,15 +5,16 @@ write in chat, browse the channels you follow and search for new ones, without
 leaving the console.
 
 It is written in Rust with no external crates. Terminal handling, JSON, reading
-the SQLite cookie store and the Twitch GraphQL client are all implemented in
-the project. Networking and media go through system tools (`curl`, `ffmpeg`,
+the SQLite cookie store, the Twitch OAuth login and API clients are all
+implemented in the project. Networking and media go through system tools (`curl`, `ffmpeg`,
 an audio player).
 
 ## Features
 
-- **Automatic login**: the Twitch session cookie is read from your Firefox
-  profile (or one of its forks), so there is no token to copy by hand.
-- **Followed channels** with their live status, title, category, viewer count
+- **Twitch login** through the official OAuth device flow: run
+  `twitch-tui --login` once and approve a code on twitch.tv, no token to copy
+  by hand.
+- **Every followed channel** with their live status, title, category, viewer count
   and uptime.
 - **Search** for channels on Twitch, and quick filtering of the followed list.
 - **Channel page**: description, follower count, whether you follow it.
@@ -44,8 +45,9 @@ You also need:
   xterm...). The bare Linux console (TTY) does not;
 - a **font with the common Unicode block and symbol characters**, used by the
   visualizer and the interface;
-- **network access** to `gql.twitch.tv` and `usher.ttvnw.net` over HTTPS, and
-  to `irc.chat.twitch.tv` on TCP port 6667 for chat.
+- **network access** to `gql.twitch.tv`, `api.twitch.tv`, `id.twitch.tv` and
+  `usher.ttvnw.net` over HTTPS, and to `irc.chat.twitch.tv` on TCP port 6667
+  for chat.
 
 ### Terminal compatibility
 
@@ -113,11 +115,35 @@ On Fedora, the full `ffmpeg` comes from the RPM Fusion repository. Replace the
 PipeWire package with `pulseaudio-utils` (for `pacat`) or `alsa-utils` (for
 `aplay`) depending on your audio stack.
 
-## Supported browsers
+## Logging in
 
-Automatic login reads the twitch.tv `auth-token` cookie from the cookie store
-(`cookies.sqlite`) of Firefox-family browsers. You only need to be logged in
-on twitch.tv in the browser.
+```sh
+twitch-tui --login
+```
+
+This prints a code and opens twitch.tv/activate in the browser (open the
+printed link yourself over SSH or without a desktop). Once you approve the
+code, the session is saved to `~/.local/state/twitch-tui/session` (or
+`$XDG_STATE_HOME/twitch-tui/session`), readable by you only, and renewed
+automatically. It is revoked and removed by `twitch-tui --logout`.
+
+The login asks Twitch for three permissions: reading your follows
+(`user:read:follows`), and reading and writing in chat (`chat:read`,
+`chat:edit`). It goes through Twitch's public API, which knows nothing of
+subscriptions and cannot follow channels.
+
+Without a login the program runs in **anonymous mode**: searching, playing
+streams and reading chat still work. The followed channels list and sending
+messages are unavailable.
+
+### Optional: the website token
+
+Separately, the program uses the token of the twitch.tv website itself when it
+finds one. It is optional: it brings your subscriber perks to playback (no
+ads, subscriber-only streams) and lets the program try to follow or unfollow
+channels. It is read from the `auth-token` cookie in the cookie store
+(`cookies.sqlite`) of Firefox-family browsers, as long as you are logged in on
+twitch.tv there.
 
 | Browser   | Profile locations searched                                                                          |
 |-----------|-----------------------------------------------------------------------------------------------------|
@@ -129,13 +155,12 @@ on twitch.tv in the browser.
 
 Every profile of every one of these browsers is searched, and the most
 recently used session wins. To pin a profile, use `--profile DIR` or
-`firefox_profile` in the config file.
+`firefox_profile` in the config file. `firefox_login = false` turns the lookup
+off.
 
 Chromium-based browsers (Chrome, Chromium, Brave, Edge, Vivaldi, Opera) **are
 not supported**: they encrypt cookie values with the system keyring. With
-those browsers, set the token by hand (see below).
-
-### Without a supported browser: manual token
+those browsers, set the token by hand:
 
 1. Log in on twitch.tv in your browser.
 2. Open the developer tools (`F12`), then Storage or Application, then
@@ -146,10 +171,6 @@ those browsers, set the token by hand (see below).
 
 This token grants access to your Twitch account: do not share it. The config
 file is created with mode `600` (readable by you only).
-
-Without a token the program runs in **anonymous mode**: searching, playing
-streams and reading chat still work. The followed channels list and sending
-messages are unavailable.
 
 ## Building and running
 
@@ -180,8 +201,8 @@ The built binary is also available at `target/release/twitch-tui`.
 twitch-tui --check-login
 ```
 
-This prints where the token comes from and which account it opens, then exits.
-The token itself is never printed.
+This prints which account the session opens, and where the website token
+comes from and whose it is, then exits. Tokens themselves are never printed.
 
 ### Command-line options
 
@@ -189,10 +210,24 @@ The token itself is never printed.
 |----------------------|----------------------------------------------------------|
 | `CHANNEL`            | channel (login or URL) to play on startup                |
 | `-v`, `--volume N`   | initial volume, 0 to 150                                 |
+| `--login`            | log in to your Twitch account, then exit                 |
+| `--logout`           | revoke and forget the session, then exit                 |
 | `--profile DIR`      | Firefox profile to read the Twitch cookie from           |
-| `--anonymous`        | start without logging in                                 |
-| `--check-login`      | report where the token comes from and the account, exit  |
+| `--anonymous`        | start without the session nor the website token          |
+| `--channels-only`    | only the channel lists, see below (alias `--compatibility`) |
+| `--check-login`      | report the account and the website token, then exit      |
 | `-h`, `--help`       | show help                                                |
+
+### Channels-only mode
+
+```sh
+twitch-tui --channels-only
+```
+
+Shows nothing but the channels panel: the followed channels with their live
+status, and search. There is no playback and no chat, so `ffmpeg` and the
+audio player are not needed. `Enter` or `o` opens the selected channel in the
+browser. `--compatibility` is an alias.
 
 ## Configuration
 
@@ -202,18 +237,18 @@ option commented. Format: one `key = value` per line, `#` for comments.
 
 | Key               | Values                                        | Default    | Purpose                                         |
 |-------------------|-----------------------------------------------|------------|-------------------------------------------------|
-| `firefox_login`   | `true`, `false`                               | `true`     | read the Twitch cookie from the browser         |
+| `firefox_login`   | `true`, `false`                               | `true`     | read the website token from the browser         |
 | `firefox_profile` | path to a profile (`~` allowed)               | none       | only look for the cookie in this profile        |
-| `token`           | value of the `auth-token` cookie              | none       | token used instead of the cookie                |
+| `token`           | value of the `auth-token` cookie              | none       | website token used instead of the cookie        |
 | `volume`          | 0 to 150                                      | `80`       | initial volume                                  |
 | `video_fps`       | 5 to 60                                       | `30`       | video frames per second                         |
 | `video_output`    | `auto`, `ascii`, `graphics`                   | `auto`     | how video is drawn                              |
 | `video_quality`   | `auto`, `360p`, `720p`, `1080p`, `source`...  | `auto`     | rendition decoded (`auto` aims for 480p)        |
 | `visualizer`      | `spectrum`, `mirror`, `scope`, `video`        | `spectrum` | visualizer on startup                           |
 
-The token is picked in this order of precedence: the `--anonymous` option,
-then the `TWITCH_TOKEN` variable, then the `token` key, then the browser
-cookie.
+The website token is picked in this order of precedence: the `--anonymous`
+option, then the `TWITCH_TOKEN` variable, then the `token` key, then the
+browser cookie.
 
 On a slow terminal or over SSH, lower `video_fps`: each ASCII frame repaints
 the whole panel.
@@ -245,14 +280,13 @@ Press `?` in the program to show the help screen.
 
 ## Twitch restrictions
 
-- **Followed channels**: outside its own website, Twitch only returns the 100
-  newest and the 100 oldest follows. Past 200 followed channels the list is
-  incomplete, and the program says so.
-- **Follow and unfollow**: Twitch guards these actions with an integrity check
-  reserved to its own website. The program still tries, and when Twitch
-  refuses, press `o` to do it in the browser.
-- The program uses the undocumented internal GraphQL API of twitch.tv, which
-  can change without notice.
+- **Follow and unfollow**: Twitch's public API cannot do it, and the website's
+  API guards these actions with an integrity check reserved to twitch.tv. With
+  the website token the program still tries, and when Twitch refuses, press
+  `o` to do it in the browser.
+- Playback, search and channel pages use the undocumented internal GraphQL
+  API of twitch.tv, which can change without notice. The login, followed
+  channels and follow state go through the public API.
 
 ## Architecture
 
@@ -261,8 +295,9 @@ together independent crates living in `crates/`:
 
 ```
 crates/
-  twitch-core/      HTTP (through curl), JSON, Twitch GraphQL client
-  twitch-auth/      token: Firefox cookies (SQLite reader), logged-in account
+  twitch-core/      HTTP (through curl), JSON, GraphQL and public API clients
+  twitch-auth/      device flow login and session file, Firefox cookies
+                    (SQLite reader), logged-in account
   twitch-channels/  followed channels, search, channel page, follow
   twitch-playlist/  HLS playlist of a live stream, quality selection
   twitch-chat/      IRC chat

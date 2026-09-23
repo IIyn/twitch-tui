@@ -80,6 +80,9 @@ struct Shared {
     channel: Option<String>,
 }
 
+/// Hands out a working access token for logging in to chat.
+pub type TokenFn = Box<dyn Fn() -> Result<String, String> + Send>;
+
 pub struct Chat {
     shared: Arc<Mutex<Shared>>,
     pub nick: String,
@@ -88,22 +91,24 @@ pub struct Chat {
 
 impl Chat {
     /// Starts the connection thread. Without a token the connection is
-    /// anonymous (read only).
-    pub fn start<E>(login: Option<String>, token: Option<String>, tx: Sender<E>) -> Chat
+    /// anonymous (read only). The token is asked for on every connection,
+    /// so an expired one can be renewed in between.
+    pub fn start<E>(login: Option<String>, token: Option<TokenFn>, tx: Sender<E>) -> Chat
     where
         E: From<ChatEvent> + Send + 'static,
     {
-        let (nick, pass) = match (login, token) {
+        let (nick, token) = match (login, token) {
             (Some(login), Some(token)) => (login.to_lowercase(), Some(token)),
             _ => (format!("justinfan{}", 10_000 + std::process::id() % 80_000), None),
         };
         let shared = Arc::new(Mutex::new(Shared { writer: None, channel: None }));
-        let chat = Chat { shared: shared.clone(), nick: nick.clone(), can_send: pass.is_some() };
+        let chat = Chat { shared: shared.clone(), nick: nick.clone(), can_send: token.is_some() };
 
         thread::spawn(move || {
             let mut backoff = 1;
             loop {
-                match session(&nick, pass.as_deref(), &shared, &tx) {
+                let pass = token.as_ref().map(|t| t()).transpose();
+                match pass.and_then(|pass| session(&nick, pass.as_deref(), &shared, &tx)) {
                     Ok(()) => backoff = 1,
                     Err(e) => {
                         let _ = tx.send(ChatEvent::Disconnected(e).into());

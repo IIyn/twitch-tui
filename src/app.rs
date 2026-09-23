@@ -10,9 +10,10 @@ use audio::{Audio, AudioEvent};
 use term::Key;
 use term::line_edit::LineEdit;
 use twitch_auth::Me;
-use twitch_channels::{Channel, ChannelDetails, Follows};
-use twitch_chat::{Chat, ChatEvent, ChatMessage, MsgKind};
+use twitch_channels::{Channel, ChannelDetails};
+use twitch_chat::{Chat, ChatEvent, ChatMessage, MsgKind, TokenFn};
 use twitch_core::Api;
+use twitch_core::helix::Helix;
 use twitch_playlist::{Quality, Rendition, StreamUrls};
 use video::{Target, Video, VideoEvent};
 
@@ -28,7 +29,7 @@ const FOLLOWING_REFRESH: Duration = Duration::from_secs(60);
 
 pub enum ApiEvent {
     Me(Result<Me, String>),
-    Following(Result<Follows, String>),
+    Following(Result<Vec<Channel>, String>),
     Search(u64, Result<Vec<Channel>, String>),
     Details(String, Result<ChannelDetails, String>),
     StreamUrls(u64, Result<StreamUrls, String>),
@@ -126,8 +127,6 @@ pub struct App {
 
     pub following: Vec<Channel>,
     pub following_state: Load,
-    /// True when Twitch withheld some follows, so the interface can say so.
-    pub following_capped: bool,
     pub filter: LineEdit,
     pub search: LineEdit,
     pub results: Vec<Channel>,
@@ -178,6 +177,8 @@ pub struct App {
     /// Style to come back to when leaving the zoom.
     unzoom_style: VizStyle,
     pub quit: bool,
+    /// Only the channel lists: no playback nor chat.
+    pub channels_only: bool,
 
     last_details: Instant,
     last_following: Instant,
@@ -186,12 +187,18 @@ pub struct App {
 
 impl App {
     pub fn new(config: &Config, tx: Sender<Event>) -> App {
-        let api = Api::new(config.token.clone());
+        let mut api = Api::new(config.token.clone());
+        if let Some(session) = config.session.clone() {
+            // A renewed refresh token voids the saved one: keep the file current.
+            api = api.with_helix(Helix::new(session, |s| {
+                let _ = twitch_auth::session::save(s);
+            }));
+        }
         let mut viz = Visualizer::new();
         viz.style = config.visualizer;
         let mut app = App {
             tx,
-            auth: if api.token().is_some() { Auth::Checking } else { Auth::Anonymous },
+            auth: if api.logged_in() { Auth::Checking } else { Auth::Anonymous },
             token_source: config.token_source.clone(),
             api,
             tab: Tab::Following,
@@ -199,7 +206,6 @@ impl App {
             typing: None,
             following: Vec::new(),
             following_state: Load::Idle,
-            following_capped: false,
             filter: LineEdit::default(),
             search: LineEdit::default(),
             results: Vec::new(),
@@ -243,13 +249,14 @@ impl App {
             zoom: false,
             unzoom_style: VizStyle::Bars,
             quit: false,
+            channels_only: config.channels_only,
             last_details: Instant::now(),
             last_following: Instant::now(),
             pending_autoplay: config.autoplay.clone(),
         };
         app.graphics = app.graphics_ok && config.video_output != VideoOutput::Ascii;
 
-        if app.api.token().is_some() {
+        if app.api.logged_in() {
             app.following_state = Load::Loading;
             app.spawn(|api| ApiEvent::Me(twitch_auth::me(api)));
         } else {
@@ -258,7 +265,11 @@ impl App {
             app.start_chat(None);
         }
         if let Some(channel) = app.pending_autoplay.take() {
-            app.play(&channel);
+            if app.channels_only {
+                app.open_in_browser(&channel);
+            } else {
+                app.play(&channel);
+            }
         }
         app
     }
@@ -283,7 +294,12 @@ impl App {
     }
 
     fn start_chat(&mut self, login: Option<String>) {
-        let token = login.as_ref().and(self.api.token().map(String::from));
+        if self.channels_only {
+            return;
+        }
+        let api = self.api.clone();
+        let token = (login.is_some() && api.logged_in())
+            .then(|| Box::new(move || api.helix()?.access_token()) as TokenFn);
         let chat = Chat::start(login, token, self.tx.clone());
         if let Some(current) = &self.current {
             chat.join(&current.channel.login);
@@ -381,9 +397,9 @@ impl App {
             self.following_state = Load::Loading;
         }
         self.spawn(|api| {
-            ApiEvent::Following(twitch_channels::followed(api).map(|mut follows| {
-                sort_channels(&mut follows.channels);
-                follows
+            ApiEvent::Following(twitch_channels::followed(api).map(|mut channels| {
+                sort_channels(&mut channels);
+                channels
             }))
         });
     }
@@ -491,18 +507,28 @@ impl App {
         self.spawn(move |api| ApiEvent::Follow(name, !following, twitch_channels::set_follow(api, &id, !following)));
     }
 
-    fn open_in_browser(&mut self) {
-        if let Some(c) = &self.current {
-            let url = format!("https://www.twitch.tv/{}", c.channel.login);
-            let spawned = std::process::Command::new("xdg-open")
-                .arg(&url)
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn();
-            match spawned {
-                Ok(_) => self.notify(format!("Opened {url}"), Level::Info),
-                Err(e) => self.notify(format!("xdg-open failed: {e}"), Level::Error),
-            }
+    /// The playing channel, or in channels-only mode the selected one.
+    fn open_current_in_browser(&mut self) {
+        let login = if self.channels_only {
+            self.visible().get(self.selected_index()).map(|c| c.login.clone())
+        } else {
+            self.current.as_ref().map(|c| c.channel.login.clone())
+        };
+        if let Some(login) = login {
+            self.open_in_browser(&login);
+        }
+    }
+
+    fn open_in_browser(&mut self, login: &str) {
+        let url = format!("https://www.twitch.tv/{login}");
+        let spawned = std::process::Command::new("xdg-open")
+            .arg(&url)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        match spawned {
+            Ok(_) => self.notify(format!("Opened {url}"), Level::Info),
+            Err(e) => self.notify(format!("xdg-open failed: {e}"), Level::Error),
         }
     }
 
@@ -596,8 +622,7 @@ impl App {
     fn on_api(&mut self, event: ApiEvent) {
         match event {
             ApiEvent::Me(Ok(me)) => {
-                let source = self.token_source.label();
-                self.notify(format!("Logged in as {} · {source}", me.display_name), Level::Success);
+                self.notify(format!("Logged in as {}", me.display_name), Level::Success);
                 let login = me.login.clone();
                 self.auth = Auth::LoggedIn(me);
                 self.start_chat(Some(login));
@@ -608,23 +633,18 @@ impl App {
                 }
             }
             ApiEvent::Me(Err(e)) => {
-                let hint = match self.token_source {
-                    TokenSource::Firefox { .. } => " — log in again on twitch.tv in Firefox",
-                    _ => "",
-                };
-                self.notify(format!("Login failed: {e}{hint}"), Level::Error);
+                self.notify(format!("Login failed: {e}"), Level::Error);
                 self.auth = Auth::Failed(e.clone());
                 self.following_state = Load::Failed(e);
-                self.api = Api::new(None);
+                self.api = self.api.without_helix();
                 self.tab = Tab::Search;
                 self.start_chat(None);
             }
-            ApiEvent::Following(Ok(follows)) => {
-                self.following_capped = !follows.complete;
+            ApiEvent::Following(Ok(channels)) => {
                 // The order changes between refreshes: keep the cursor on its channel.
                 let slot = Tab::Following as usize;
                 let kept = self.visible_following().get(self.selected[slot]).map(|c| c.login.clone());
-                self.following = follows.channels;
+                self.following = channels;
                 if let Some(i) = kept.and_then(|l| self.visible_following().iter().position(|c| c.login == l)) {
                     self.selected[slot] = i;
                 }
@@ -882,6 +902,15 @@ impl App {
             return;
         }
 
+        // Keys of the player and the chat do nothing without them.
+        let player_key = matches!(
+            key,
+            Key::Tab | Key::BackTab | Key::Char('i' | 'f' | ' ' | 'p' | '+' | '=' | '-' | '_' | 'm' | 'v' | 'z' | 'c' | 'a')
+        );
+        if self.channels_only && player_key {
+            return;
+        }
+
         match key {
             Key::Char('q') => self.quit = true,
             Key::Char('?') => self.show_help = true,
@@ -937,7 +966,7 @@ impl App {
             Key::Char('a') => {
                 self.notify("This terminal cannot show a real picture (kitty or Ghostty needed)", Level::Info)
             }
-            Key::Char('o') => self.open_in_browser(),
+            Key::Char('o') => self.open_current_in_browser(),
             Key::Char('r') => {
                 self.refresh_following();
                 if let Some(c) = &self.current {
@@ -973,6 +1002,7 @@ impl App {
             Key::Enter => {
                 let login = self.visible().get(self.selected_index()).map(|c| c.login.clone());
                 match login {
+                    Some(login) if self.channels_only => self.open_in_browser(&login),
                     Some(login) => self.play(&login),
                     None if self.tab == Tab::Search => self.typing = Some(Typing::Search),
                     None => {}
