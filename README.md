@@ -33,10 +33,21 @@ an audio player).
 
 ## System requirements
 
-**Linux only.** The terminal is driven directly through libc calls (`termios`,
-`ioctl`, `sigaction`) using Linux structure layouts and constants. The program
-also relies on `/dev/urandom`, `/dev/shm` and `xdg-open`. macOS, the BSDs and
-Windows are not supported. WSL2 on Windows may work but has not been tested.
+**Linux** runs everything. The player relies on Linux: audio players, pipes
+handed to `ffmpeg`, `/dev/shm` for the picture.
+
+**macOS and Windows** (10 or later) run the
+[channels-only mode](#channels-only-mode), which starts on its own there:
+followed channels, search, opening a channel in the browser. The terminal is
+driven through libc on macOS and through the console API on Windows, which
+needs Windows Terminal or a console with escape sequence support. Both only
+need `curl`, which Windows 10 and 11 ship. These two platforms are built but
+not yet tested by the author. The BSDs are not supported.
+
+The player crates (`audio`, `video`, `twitch-playlist`, `twitch-chat`) are
+Linux-only dependencies in `Cargo.toml`: builds for other systems do not
+compile them at all, and the code using them is behind
+`#[cfg(target_os = "linux")]`.
 
 You also need:
 
@@ -94,7 +105,8 @@ Notes:
 | `pw-cat`, `pacat` or `aplay`   | for sound   | audio output (PipeWire, PulseAudio or ALSA)        |
 | `xdg-open`                     | no          | opening a channel in the browser (`o` key)         |
 
-The program refuses to start if `curl` or `ffmpeg` is missing. It picks the
+The program refuses to start if `curl` or `ffmpeg` is missing (only `curl`
+in channels-only mode). It picks the
 first available audio player in the order `pw-cat`, `pacat`, `aplay`. If none
 is found, the interface and chat still work, without sound.
 
@@ -227,7 +239,13 @@ twitch-tui --channels-only
 Shows nothing but the channels panel: the followed channels with their live
 status, and search. There is no playback and no chat, so `ffmpeg` and the
 audio player are not needed. `Enter` or `o` opens the selected channel in the
-browser. `--compatibility` is an alias.
+browser (`xdg-open` on Linux, `open` on macOS). `--compatibility` is an
+alias. It is the only mode on macOS and Windows.
+
+On Windows the config file is `%APPDATA%\twitch-tui\config` and the session
+`%LOCALAPPDATA%\twitch-tui\session`. To build there, use the
+`x86_64-pc-windows-msvc` (Visual Studio build tools) or `x86_64-pc-windows-gnu`
+(MinGW) toolchain.
 
 ## Configuration
 
@@ -303,14 +321,16 @@ crates/
   twitch-chat/      IRC chat
   audio/            ffmpeg to PCM, output through pw-cat / pacat / aplay
   video/            ffmpeg to RGB frames sized to the panel, plus synced PCM
-  term/             terminal: raw mode, double-buffered screen, keyboard
+  term/             terminal: raw mode (libc or Windows console), screen, keyboard
 src/
   main.rs           main loop and events
-  app.rs            application state and logic
-  ui.rs             interface rendering
+  app.rs            application state: login, channel lists, keys
+  app/player.rs     playback, picture, chat (Linux)
+  ui.rs             interface rendering: header, lists, footer, help
+  ui/player.rs      now playing, visualizer, chat panels (Linux)
   config.rs         config file and command line
-  graphics.rs       kitty graphics protocol
-  viz.rs            audio visualizers
+  graphics.rs       kitty graphics protocol (Linux)
+  viz.rs            audio visualizers (Linux)
   theme.rs, util.rs
 ```
 

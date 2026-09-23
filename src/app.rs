@@ -1,29 +1,26 @@
-//! Application state and behaviour.
+//! Application state and behaviour: logging in and the channel lists. The
+//! player and the chat, Linux only, live in `player`.
 
-use std::collections::VecDeque;
-use std::sync::atomic::Ordering;
+#[cfg(target_os = "linux")]
+pub mod player;
+
 use std::sync::mpsc::Sender;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use audio::{Audio, AudioEvent};
 use term::Key;
 use term::line_edit::LineEdit;
 use twitch_auth::Me;
-use twitch_channels::{Channel, ChannelDetails};
-use twitch_chat::{Chat, ChatEvent, ChatMessage, MsgKind, TokenFn};
+use twitch_channels::Channel;
 use twitch_core::Api;
 use twitch_core::helix::Helix;
-use twitch_playlist::{Quality, Rendition, StreamUrls};
-use video::{Target, Video, VideoEvent};
 
 use crate::Event;
-use crate::config::{Config, TokenSource, VideoOutput};
-use crate::viz::{VizStyle, Visualizer};
+use crate::config::{Config, TokenSource};
+#[cfg(target_os = "linux")]
+use player::{Player, PlayerApi};
 
-const CHAT_HISTORY: usize = 600;
 const SEARCH_DEBOUNCE: Duration = Duration::from_millis(450);
-const DETAILS_REFRESH: Duration = Duration::from_secs(60);
 /// Often enough to catch streams as they start; `r` refreshes on demand.
 const FOLLOWING_REFRESH: Duration = Duration::from_secs(60);
 
@@ -31,9 +28,8 @@ pub enum ApiEvent {
     Me(Result<Me, String>),
     Following(Result<Vec<Channel>, String>),
     Search(u64, Result<Vec<Channel>, String>),
-    Details(String, Result<ChannelDetails, String>),
-    StreamUrls(u64, Result<StreamUrls, String>),
-    Follow(String, bool, Result<(), String>),
+    #[cfg(target_os = "linux")]
+    Player(PlayerApi),
     /// A background request died unexpectedly.
     Crashed(String),
 }
@@ -47,12 +43,14 @@ pub enum Tab {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
     Sidebar,
+    #[cfg(target_os = "linux")]
     Chat,
 }
 
 /// Which text field currently receives keystrokes.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Typing {
+    #[cfg(target_os = "linux")]
     Chat,
     Search,
     Filter,
@@ -67,30 +65,11 @@ pub enum Load {
 }
 
 #[derive(Clone, PartialEq, Eq)]
-pub enum Playback {
-    Idle,
-    Resolving,
-    Buffering,
-    Playing(Instant),
-    Paused,
-    Offline,
-    Failed(String),
-}
-
-#[derive(Clone, PartialEq, Eq)]
 pub enum Auth {
     Anonymous,
     Checking,
     LoggedIn(Me),
     Failed(String),
-}
-
-#[derive(Clone, PartialEq, Eq)]
-pub enum ChatState {
-    Connecting,
-    Connected,
-    Joined,
-    Disconnected(String),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -135,54 +114,15 @@ pub struct App {
     search_due: Option<Instant>,
     pub selected: [usize; 2],
 
-    pub current: Option<ChannelDetails>,
-    pub playback: Playback,
-    play_id: u64,
-    pub follow_pending: bool,
-
-    pub chat: Option<Chat>,
-    pub chat_state: ChatState,
-    pub messages: VecDeque<ChatMessage>,
-    /// Number of messages hidden below the bottom of the chat view.
-    pub chat_scroll: usize,
-    pub chat_input: LineEdit,
-    history: Vec<String>,
-    history_pos: Option<usize>,
-    my_name: Option<String>,
-    my_color: Option<[u8; 3]>,
-
-    pub audio: Audio,
-    /// Audio-only rendition of the current stream.
-    audio_url: Option<String>,
-    /// The sound comes from the video decoder rather than the audio-only
-    /// rendition, so it matches the picture.
-    pub audio_from_video: bool,
-    pub video: Video,
-    /// Renditions carrying video for the current channel, smallest first.
-    renditions: Vec<Rendition>,
-    pub video_quality: Quality,
-    video_started: Instant,
-    /// Decoded frames per second, smoothed, for the panel title.
-    pub video_fps: f32,
-    video_counted: (u64, Instant),
-    /// The terminal can show a real picture.
-    graphics_ok: bool,
-    /// The picture is drawn with the graphics protocol instead of ASCII.
-    pub graphics: bool,
-    pub viz: Visualizer,
     pub toast: Option<Toast>,
     pub show_help: bool,
-    /// The ASCII picture fills the window.
-    pub zoom: bool,
-    /// Style to come back to when leaving the zoom.
-    unzoom_style: VizStyle,
     pub quit: bool,
-    /// Only the channel lists: no playback nor chat.
+    /// Only the channel lists: no playback nor chat. Always on outside Linux.
     pub channels_only: bool,
-
-    last_details: Instant,
     last_following: Instant,
-    pending_autoplay: Option<String>,
+
+    #[cfg(target_os = "linux")]
+    pub player: Player,
 }
 
 impl App {
@@ -194,8 +134,6 @@ impl App {
                 let _ = twitch_auth::session::save(s);
             }));
         }
-        let mut viz = Visualizer::new();
-        viz.style = config.visualizer;
         let mut app = App {
             tx,
             auth: if api.logged_in() { Auth::Checking } else { Auth::Anonymous },
@@ -213,48 +151,14 @@ impl App {
             search_seq: 0,
             search_due: None,
             selected: [0, 0],
-            current: None,
-            playback: Playback::Idle,
-            play_id: 0,
-            follow_pending: false,
-            chat: None,
-            chat_state: ChatState::Connecting,
-            messages: VecDeque::new(),
-            chat_scroll: 0,
-            chat_input: LineEdit::default(),
-            history: Vec::new(),
-            history_pos: None,
-            my_name: None,
-            my_color: None,
-            audio: Audio::new(config.volume),
-            audio_url: None,
-            audio_from_video: false,
-            video: {
-                let mut video = Video::new();
-                video.fps = config.video_fps;
-                let bg = crate::theme::panel().bg;
-                video.background = [bg.0, bg.1, bg.2];
-                video
-            },
-            renditions: Vec::new(),
-            video_quality: config.video_quality,
-            video_started: Instant::now(),
-            video_fps: 0.0,
-            video_counted: (0, Instant::now()),
-            graphics_ok: config.video_output == VideoOutput::Graphics || crate::graphics::supported(),
-            graphics: false,
-            viz,
             toast: None,
             show_help: false,
-            zoom: false,
-            unzoom_style: VizStyle::Bars,
             quit: false,
             channels_only: config.channels_only,
-            last_details: Instant::now(),
             last_following: Instant::now(),
-            pending_autoplay: config.autoplay.clone(),
+            #[cfg(target_os = "linux")]
+            player: Player::new(config),
         };
-        app.graphics = app.graphics_ok && config.video_output != VideoOutput::Ascii;
 
         if app.api.logged_in() {
             app.following_state = Load::Loading;
@@ -262,14 +166,11 @@ impl App {
         } else {
             // Anonymous: read-only chat, start on the search tab.
             app.tab = Tab::Search;
+            #[cfg(target_os = "linux")]
             app.start_chat(None);
         }
-        if let Some(channel) = app.pending_autoplay.take() {
-            if app.channels_only {
-                app.open_in_browser(&channel);
-            } else {
-                app.play(&channel);
-            }
+        if let Some(channel) = &config.autoplay {
+            app.activate(channel);
         }
         app
     }
@@ -293,53 +194,9 @@ impl App {
         });
     }
 
-    fn start_chat(&mut self, login: Option<String>) {
-        if self.channels_only {
-            return;
-        }
-        let api = self.api.clone();
-        let token = (login.is_some() && api.logged_in())
-            .then(|| Box::new(move || api.helix()?.access_token()) as TokenFn);
-        let chat = Chat::start(login, token, self.tx.clone());
-        if let Some(current) = &self.current {
-            chat.join(&current.channel.login);
-        }
-        self.chat = Some(chat);
-    }
-
     pub fn notify(&mut self, text: impl Into<String>, level: Level) {
         let secs = if level == Level::Error { 6 } else { 3 };
         self.toast = Some(Toast { text: text.into(), level, until: Instant::now() + Duration::from_secs(secs) });
-    }
-
-    /// Whether the current stream offers a rendition with video.
-    pub fn video_available(&self) -> bool {
-        !self.renditions.is_empty()
-    }
-
-    /// Rendition the picture is decoded from.
-    pub fn rendition(&self) -> Option<&Rendition> {
-        self.video_quality.pick(&self.renditions)
-    }
-
-    /// Steps through auto, then every height on offer, smallest first.
-    fn cycle_quality(&mut self) {
-        let mut heights: Vec<u32> = self.renditions.iter().map(|r| r.height).collect();
-        heights.dedup();
-        if heights.is_empty() {
-            self.notify("No video to pick a quality for", Level::Info);
-            return;
-        }
-        self.video_quality = match self.video_quality {
-            Quality::Auto => Quality::MaxHeight(heights[0]),
-            Quality::MaxHeight(current) => match heights.iter().find(|h| **h > current) {
-                Some(h) => Quality::MaxHeight(*h),
-                None => Quality::Auto,
-            },
-        };
-        let name = self.rendition().map(|r| r.name.clone()).unwrap_or_default();
-        let label = if self.video_quality == Quality::Auto { format!("auto ({name})") } else { name };
-        self.notify(format!("Video quality: {label}"), Level::Info);
     }
 
     pub fn me(&self) -> Option<&Me> {
@@ -377,6 +234,10 @@ impl App {
 
     pub fn selected_index(&self) -> usize {
         self.selected[self.tab_index()].min(self.visible().len().saturating_sub(1))
+    }
+
+    fn selected_login(&self) -> Option<String> {
+        self.visible().get(self.selected_index()).map(|c| c.login.clone())
     }
 
     fn move_selection(&mut self, delta: isize) {
@@ -418,102 +279,23 @@ impl App {
         self.spawn(move |api| ApiEvent::Search(seq, twitch_channels::search(api, &query)));
     }
 
-    // ------------------------------------------------------------ playback
-
-    pub fn play(&mut self, login: &str) {
-        let login = login.trim().trim_start_matches('#').to_lowercase();
-        if login.is_empty() {
+    /// Enter on a channel: play it, or in channels-only mode open it in the
+    /// browser.
+    fn activate(&mut self, login: &str) {
+        #[cfg(target_os = "linux")]
+        if !self.channels_only {
+            self.play(login);
             return;
         }
-        self.audio.stop();
-        self.video.stop();
-        self.audio_from_video = false;
-        self.audio_url = None;
-        self.renditions.clear();
-        self.play_id += 1;
-        let id = self.play_id;
-
-        let known = self
-            .following
-            .iter()
-            .chain(self.results.iter())
-            .find(|c| c.login == login)
-            .cloned();
-        let is_switch = self.current.as_ref().is_none_or(|c| c.channel.login != login);
-        if is_switch {
-            self.current = Some(ChannelDetails {
-                channel: known.unwrap_or_else(|| Channel {
-                    id: String::new(),
-                    login: login.clone(),
-                    display_name: login.clone(),
-                    stream: None,
-                }),
-                description: String::new(),
-                followers: 0,
-                following: None,
-            });
-            self.messages.clear();
-            self.chat_scroll = 0;
-            self.messages.push_back(ChatMessage::system(format!("Joining #{login}…")));
-            if let Some(chat) = &self.chat {
-                chat.join(&login);
-            }
-            let l = login.clone();
-            self.spawn(move |api| ApiEvent::Details(l.clone(), twitch_channels::channel(api, &l)));
-            self.last_details = Instant::now();
-        }
-
-        self.playback = Playback::Resolving;
-        self.spawn(move |api| ApiEvent::StreamUrls(id, twitch_playlist::stream_urls(api, &login)));
-    }
-
-    fn toggle_playback(&mut self) {
-        if self.audio.is_active() || matches!(self.playback, Playback::Resolving) {
-            self.play_id += 1;
-            self.audio.stop();
-            self.playback = Playback::Paused;
-        } else if let Some(login) = self.current.as_ref().map(|c| c.channel.login.clone()) {
-            self.play(&login);
-        } else {
-            self.notify("Pick a channel first (Enter on the list)", Level::Info);
-        }
-    }
-
-    fn change_volume(&mut self, delta: i32) {
-        let v = (self.audio.volume.load(Ordering::Relaxed) as i32 + delta).clamp(0, 150) as u32;
-        self.audio.volume.store(v, Ordering::Relaxed);
-        self.audio.muted.store(false, Ordering::Relaxed);
-    }
-
-    fn toggle_follow(&mut self) {
-        if self.me().is_none() {
-            self.notify("Log in to follow channels (press ? for setup)", Level::Error);
-            return;
-        }
-        let Some(current) = &self.current else {
-            self.notify("Nothing is playing", Level::Info);
-            return;
-        };
-        let (Some(following), false) = (current.following, current.channel.id.is_empty()) else {
-            self.notify("Channel info still loading…", Level::Info);
-            return;
-        };
-        if self.follow_pending {
-            return;
-        }
-        self.follow_pending = true;
-        let id = current.channel.id.clone();
-        let name = current.channel.display_name.clone();
-        self.spawn(move |api| ApiEvent::Follow(name, !following, twitch_channels::set_follow(api, &id, !following)));
+        self.open_in_browser(login);
     }
 
     /// The playing channel, or in channels-only mode the selected one.
     fn open_current_in_browser(&mut self) {
-        let login = if self.channels_only {
-            self.visible().get(self.selected_index()).map(|c| c.login.clone())
-        } else {
-            self.current.as_ref().map(|c| c.channel.login.clone())
-        };
+        #[cfg(target_os = "linux")]
+        let login = if self.channels_only { self.selected_login() } else { self.player.current_login() };
+        #[cfg(not(target_os = "linux"))]
+        let login = self.selected_login();
         if let Some(login) = login {
             self.open_in_browser(&login);
         }
@@ -521,83 +303,10 @@ impl App {
 
     fn open_in_browser(&mut self, login: &str) {
         let url = format!("https://www.twitch.tv/{login}");
-        let spawned = std::process::Command::new("xdg-open")
-            .arg(&url)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn();
-        match spawned {
-            Ok(_) => self.notify(format!("Opened {url}"), Level::Info),
-            Err(e) => self.notify(format!("xdg-open failed: {e}"), Level::Error),
+        match crate::util::open_url(&url) {
+            Ok(()) => self.notify(format!("Opened {url}"), Level::Info),
+            Err(e) => self.notify(format!("Cannot open the browser: {e}"), Level::Error),
         }
-    }
-
-    // ------------------------------------------------------------ chat
-
-    fn push_message(&mut self, msg: ChatMessage) {
-        self.messages.push_back(msg);
-        if self.chat_scroll > 0 {
-            self.chat_scroll += 1;
-        }
-        while self.messages.len() > CHAT_HISTORY {
-            self.messages.pop_front();
-            self.chat_scroll = self.chat_scroll.min(self.messages.len().saturating_sub(1));
-        }
-    }
-
-    fn send_chat(&mut self) {
-        let text = self.chat_input.text().trim().to_string();
-        if text.is_empty() {
-            return;
-        }
-        let Some(chat) = &self.chat else { return };
-        match chat.send(&text) {
-            Ok(()) => {
-                let name = self
-                    .my_name
-                    .clone()
-                    .or_else(|| self.me().map(|m| m.display_name.clone()))
-                    .unwrap_or_else(|| chat.nick.clone());
-                let (kind, body) = match text.strip_prefix("/me ") {
-                    Some(action) => (MsgKind::Action, action.to_string()),
-                    None => (MsgKind::Normal, text.clone()),
-                };
-                let mut msg = ChatMessage::system(body);
-                msg.kind = kind;
-                msg.author_login = chat.nick.clone();
-                msg.author = name;
-                msg.color = self.my_color;
-                self.push_message(msg);
-                self.chat_scroll = 0;
-                self.history.push(text);
-                self.history_pos = None;
-                self.chat_input.clear();
-            }
-            Err(e) => self.notify(e, Level::Error),
-        }
-    }
-
-    fn recall_history(&mut self, older: bool) {
-        if self.history.is_empty() {
-            return;
-        }
-        let pos = match (self.history_pos, older) {
-            (None, true) => Some(self.history.len() - 1),
-            (None, false) => None,
-            (Some(p), true) => Some(p.saturating_sub(1)),
-            (Some(p), false) if p + 1 < self.history.len() => Some(p + 1),
-            (Some(_), false) => None,
-        };
-        self.history_pos = pos;
-        match pos {
-            Some(p) => self.chat_input.set(&self.history[p].clone()),
-            None => self.chat_input.clear(),
-        }
-    }
-
-    fn scroll_chat(&mut self, delta: isize) {
-        let max = self.messages.len().saturating_sub(1) as isize;
-        self.chat_scroll = (self.chat_scroll as isize + delta).clamp(0, max) as usize;
     }
 
     // ------------------------------------------------------------ events
@@ -606,16 +315,8 @@ impl App {
         match event {
             Event::Key(key) => self.on_key(key),
             Event::Api(e) => self.on_api(e),
-            Event::Chat(e) => self.on_chat(e),
-            Event::Audio(e) => self.on_audio(e),
-            Event::Video(VideoEvent::Stopped(reason)) => {
-                self.back_to_audio_only();
-                // Retry later rather than switching the sound back and forth.
-                self.video_started = Instant::now() + Duration::from_secs(3);
-                if self.viz.style == VizStyle::Video {
-                    self.notify(format!("Video stopped: {reason}"), Level::Error);
-                }
-            }
+            #[cfg(target_os = "linux")]
+            Event::Player(e) => self.on_player_event(e),
         }
     }
 
@@ -623,14 +324,10 @@ impl App {
         match event {
             ApiEvent::Me(Ok(me)) => {
                 self.notify(format!("Logged in as {}", me.display_name), Level::Success);
-                let login = me.login.clone();
                 self.auth = Auth::LoggedIn(me);
-                self.start_chat(Some(login));
+                #[cfg(target_os = "linux")]
+                self.player_logged_in();
                 self.refresh_following();
-                if let Some(c) = &self.current {
-                    let l = c.channel.login.clone();
-                    self.spawn(move |api| ApiEvent::Details(l.clone(), twitch_channels::channel(api, &l)));
-                }
             }
             ApiEvent::Me(Err(e)) => {
                 self.notify(format!("Login failed: {e}"), Level::Error);
@@ -638,6 +335,7 @@ impl App {
                 self.following_state = Load::Failed(e);
                 self.api = self.api.without_helix();
                 self.tab = Tab::Search;
+                #[cfg(target_os = "linux")]
                 self.start_chat(None);
             }
             ApiEvent::Following(Ok(channels)) => {
@@ -665,31 +363,8 @@ impl App {
                 Err(e) => self.search_state = Load::Failed(e),
             },
             ApiEvent::Search(..) => {}
-            ApiEvent::Details(login, result) => {
-                let Some(current) = &mut self.current else { return };
-                if current.channel.login != login {
-                    return;
-                }
-                match result {
-                    Ok(details) => *current = details,
-                    Err(e) => self.notify(e, Level::Error),
-                }
-            }
-            ApiEvent::StreamUrls(id, _) if id != self.play_id => {}
-            ApiEvent::StreamUrls(id, Ok(urls)) => {
-                self.playback = Playback::Buffering;
-                self.renditions = urls.video;
-                self.audio_url = Some(urls.audio.clone());
-                self.audio.play(urls.audio, id, self.tx.clone());
-            }
-            ApiEvent::StreamUrls(_, Err(e)) => {
-                if e.contains("offline") {
-                    self.playback = Playback::Offline;
-                } else {
-                    self.notify(e.clone(), Level::Error);
-                    self.playback = Playback::Failed(e);
-                }
-            }
+            #[cfg(target_os = "linux")]
+            ApiEvent::Player(e) => self.on_player_api(e),
             ApiEvent::Crashed(reason) => {
                 self.notify(format!("Request failed: {reason}"), Level::Error);
                 if self.auth == Auth::Checking {
@@ -698,183 +373,23 @@ impl App {
                 if self.following_state == Load::Loading {
                     self.following_state = Load::Failed(reason.clone());
                 }
-                if matches!(self.playback, Playback::Resolving) {
-                    self.playback = Playback::Failed(reason);
-                }
-                self.follow_pending = false;
-            }
-            ApiEvent::Follow(name, follow, result) => {
-                self.follow_pending = false;
-                match result {
-                    Ok(()) => {
-                        if let Some(c) = self.current.as_mut().filter(|c| c.channel.display_name == name) {
-                            c.following = Some(follow);
-                        }
-                        let text = if follow { format!("♥ Followed {name}") } else { format!("Unfollowed {name}") };
-                        self.notify(text, Level::Success);
-                        self.refresh_following();
-                    }
-                    Err(e) => self.notify(e, Level::Error),
-                }
+                #[cfg(target_os = "linux")]
+                self.player_request_crashed(reason);
             }
         }
     }
 
-    fn on_chat(&mut self, event: ChatEvent) {
-        let current = self.current.as_ref().map(|c| c.channel.login.clone());
-        match event {
-            ChatEvent::Connected => self.chat_state = ChatState::Connected,
-            ChatEvent::Disconnected(e) => {
-                self.chat_state = ChatState::Disconnected(e.clone());
-                if current.is_some() {
-                    self.push_message(ChatMessage::system(format!("Disconnected: {e}. Reconnecting…")));
-                }
-            }
-            ChatEvent::Joined(channel) => {
-                if Some(&channel) == current.as_ref() {
-                    self.chat_state = ChatState::Joined;
-                    self.push_message(ChatMessage::system(format!("Welcome to #{channel}'s chat")));
-                }
-            }
-            ChatEvent::Message(channel, msg) => {
-                if Some(&channel) == current.as_ref() || (channel.is_empty() && current.is_some()) {
-                    self.push_message(msg);
-                }
-            }
-            ChatEvent::Clear(channel, target) => {
-                if Some(&channel) != current.as_ref() {
-                    return;
-                }
-                match target {
-                    Some(user) => {
-                        for m in self.messages.iter_mut().filter(|m| m.author_login == user) {
-                            m.deleted = true;
-                        }
-                    }
-                    None => {
-                        self.messages.clear();
-                        self.chat_scroll = 0;
-                        self.push_message(ChatMessage::system("Chat was cleared by a moderator"));
-                    }
-                }
-            }
-            ChatEvent::DeleteMessage(id) => {
-                if let Some(m) = self.messages.iter_mut().find(|m| m.id == id) {
-                    m.deleted = true;
-                }
-            }
-            ChatEvent::Identity { display_name, color } => {
-                self.my_name = Some(display_name);
-                if color.is_some() {
-                    self.my_color = color;
-                }
-            }
-        }
-    }
-
-    fn on_audio(&mut self, event: AudioEvent) {
-        match event {
-            AudioEvent::Playing(id) if id == self.play_id => {
-                // Keep counting from the first start when the source switches.
-                if !matches!(self.playback, Playback::Playing(_)) {
-                    self.playback = Playback::Playing(Instant::now());
-                }
-            }
-            // The video decoder died, taking the sound with it: its own event
-            // reports why, the stream goes on from the audio-only rendition.
-            AudioEvent::Stopped(id, _) if id == self.play_id && self.audio_from_video => self.back_to_audio_only(),
-            AudioEvent::Stopped(id, err) if id == self.play_id => {
-                self.playback = match err {
-                    Some(e) if e != "stream ended" => {
-                        self.notify(format!("Playback stopped: {e}"), Level::Error);
-                        Playback::Failed(e)
-                    }
-                    _ => Playback::Offline,
-                };
-            }
-            _ => {}
-        }
-    }
-
-    pub fn tick(&mut self, dt: f32, viz: (u16, u16)) {
+    /// Timers of the lists. The player has its own, `tick_player`.
+    pub fn tick(&mut self) {
         if self.toast.as_ref().is_some_and(|t| Instant::now() >= t.until) {
             self.toast = None;
         }
         if self.search_due.is_some_and(|due| Instant::now() >= due) {
             self.run_search();
         }
-        if let Some(c) = self.current.as_ref().filter(|_| self.last_details.elapsed() >= DETAILS_REFRESH) {
-            let l = c.channel.login.clone();
-            self.last_details = Instant::now();
-            self.spawn(move |api| ApiEvent::Details(l.clone(), twitch_channels::channel(api, &l)));
-        }
         if self.me().is_some() && self.last_following.elapsed() >= FOLLOWING_REFRESH {
             self.refresh_following();
         }
-
-        self.tick_video(viz);
-
-        let samples: Vec<f32> = match self.audio.tap.lock() {
-            Ok(tap) if matches!(self.playback, Playback::Playing(_)) => tap.samples.iter().copied().collect(),
-            _ => Vec::new(),
-        };
-        let count = self.viz.bar_count(viz.0);
-        self.viz.update(&samples, count, dt);
-    }
-
-    /// Starts, stops and resizes the picture decoder to follow the panel.
-    fn tick_video(&mut self, (cols, rows): (u16, u16)) {
-
-        let wanted = self.viz.style == VizStyle::Video
-            && matches!(self.playback, Playback::Playing(_) | Playback::Buffering);
-        if !wanted {
-            self.back_to_audio_only();
-            return;
-        }
-        // Measure the rate actually achieved, over a short window.
-        let elapsed = self.video_counted.1.elapsed().as_secs_f32();
-        if elapsed >= 0.5 {
-            let decoded = self.video.decoded();
-            let rate = decoded.saturating_sub(self.video_counted.0) as f32 / elapsed;
-            self.video_fps = if self.video_fps == 0.0 { rate } else { self.video_fps * 0.6 + rate * 0.4 };
-            self.video_counted = (decoded, Instant::now());
-        }
-
-        let Some(rendition) = self.rendition() else { return };
-        let target = match term::cell_pixels() {
-            Some(cell) if self.graphics => Target::pixels(cols, rows, cell, (rendition.width, rendition.height)),
-            _ => Target::ascii(cols, rows),
-        };
-        let url = rendition.url.clone();
-        let restart = !self.video.is_running() || self.video.needs_restart(&url, target);
-        // Debounced, so dragging the window does not restart ffmpeg per frame.
-        if restart && self.video_started.elapsed() >= Duration::from_millis(500) {
-            self.video_started = Instant::now();
-            // Stopped first, so the old decoder's end is not taken for the
-            // stream's.
-            self.audio.stop();
-            match self.video.start(&url, target, self.tx.clone()) {
-                Some(feed) => {
-                    self.audio.play_from(feed.pcm, feed.heard, self.play_id, self.tx.clone());
-                    self.audio_from_video = true;
-                }
-                None => self.back_to_audio_only(),
-            }
-        }
-    }
-
-    /// Stops the picture and, if the sound came with it, plays the audio-only
-    /// rendition again.
-    fn back_to_audio_only(&mut self) {
-        let was_feeding = std::mem::take(&mut self.audio_from_video);
-        if was_feeding && matches!(self.playback, Playback::Playing(_) | Playback::Buffering)
-            && let Some(url) = self.audio_url.clone()
-        {
-            // Before stopping the video, so its end is not reported as the
-            // stream's.
-            self.audio.play(url, self.play_id, self.tx.clone());
-        }
-        self.video.stop();
     }
 
     // ------------------------------------------------------------ keys
@@ -892,31 +407,14 @@ impl App {
             self.on_typing_key(typing, key);
             return;
         }
-
-        // Chat and the lists are hidden while zoomed, so reaching for them
-        // leaves the zoom first.
-        if self.zoom && matches!(key, Key::Char('i') | Key::Tab) {
-            self.leave_zoom();
-            self.focus = Focus::Chat;
-            self.typing = Some(Typing::Chat);
-            return;
-        }
-
-        // Keys of the player and the chat do nothing without them.
-        let player_key = matches!(
-            key,
-            Key::Tab | Key::BackTab | Key::Char('i' | 'f' | ' ' | 'p' | '+' | '=' | '-' | '_' | 'm' | 'v' | 'z' | 'c' | 'a')
-        );
-        if self.channels_only && player_key {
+        #[cfg(target_os = "linux")]
+        if !self.channels_only && self.on_player_key(&key) {
             return;
         }
 
         match key {
             Key::Char('q') => self.quit = true,
             Key::Char('?') => self.show_help = true,
-            Key::Tab | Key::BackTab => {
-                self.focus = if self.focus == Focus::Sidebar { Focus::Chat } else { Focus::Sidebar };
-            }
             Key::Char('1') => {
                 self.tab = Tab::Following;
                 self.focus = Focus::Sidebar;
@@ -934,58 +432,20 @@ impl App {
                 self.focus = Focus::Sidebar;
                 self.typing = Some(if self.tab == Tab::Following { Typing::Filter } else { Typing::Search });
             }
-            Key::Char('i') => {
-                self.focus = Focus::Chat;
-                self.typing = Some(Typing::Chat);
-            }
-            Key::Char('f') => self.toggle_follow(),
-            Key::Char(' ') | Key::Char('p') => self.toggle_playback(),
-            Key::Char('+') | Key::Char('=') => self.change_volume(5),
-            Key::Char('-') | Key::Char('_') => self.change_volume(-5),
-            Key::Char('m') => {
-                let muted = !self.audio.muted.load(Ordering::Relaxed);
-                self.audio.muted.store(muted, Ordering::Relaxed);
-            }
-            Key::Char('v') => {
-                self.viz.style = self.viz.style.next();
-                self.zoom = self.zoom && self.viz.style == VizStyle::Video;
-            }
-            // One key for the big picture, whatever the current style.
-            Key::Char('z') => {
-                self.zoom = !self.zoom;
-                if self.zoom {
-                    self.unzoom_style = self.viz.style;
-                    self.viz.style = VizStyle::Video;
-                } else {
-                    self.viz.style = self.unzoom_style;
-                }
-            }
-            Key::Esc if self.zoom => self.leave_zoom(),
-            Key::Char('c') => self.cycle_quality(),
-            Key::Char('a') if self.graphics_ok => self.graphics = !self.graphics,
-            Key::Char('a') => {
-                self.notify("This terminal cannot show a real picture (kitty or Ghostty needed)", Level::Info)
-            }
             Key::Char('o') => self.open_current_in_browser(),
             Key::Char('r') => {
                 self.refresh_following();
-                if let Some(c) = &self.current {
-                    let l = c.channel.login.clone();
-                    self.spawn(move |api| ApiEvent::Details(l.clone(), twitch_channels::channel(api, &l)));
-                }
+                #[cfg(target_os = "linux")]
+                self.refresh_details();
                 self.notify("Refreshing…", Level::Info);
             }
             Key::Esc if !self.filter.is_empty() => self.filter.clear(),
             _ => match self.focus {
                 Focus::Sidebar => self.on_sidebar_key(key),
+                #[cfg(target_os = "linux")]
                 Focus::Chat => self.on_chat_key(key),
             },
         }
-    }
-
-    fn leave_zoom(&mut self) {
-        self.zoom = false;
-        self.viz.style = self.unzoom_style;
     }
 
     fn on_sidebar_key(&mut self, key: Key) {
@@ -999,28 +459,11 @@ impl App {
             Key::Left | Key::Char('h') | Key::Right | Key::Char('l') => {
                 self.tab = if self.tab == Tab::Following { Tab::Search } else { Tab::Following };
             }
-            Key::Enter => {
-                let login = self.visible().get(self.selected_index()).map(|c| c.login.clone());
-                match login {
-                    Some(login) if self.channels_only => self.open_in_browser(&login),
-                    Some(login) => self.play(&login),
-                    None if self.tab == Tab::Search => self.typing = Some(Typing::Search),
-                    None => {}
-                }
-            }
-            _ => {}
-        }
-    }
-
-    fn on_chat_key(&mut self, key: Key) {
-        match key {
-            Key::Up | Key::Char('k') => self.scroll_chat(1),
-            Key::Down | Key::Char('j') => self.scroll_chat(-1),
-            Key::PageUp | Key::Ctrl('u') => self.scroll_chat(10),
-            Key::PageDown | Key::Ctrl('d') => self.scroll_chat(-10),
-            Key::Home | Key::Char('g') => self.scroll_chat(isize::MAX / 2),
-            Key::End | Key::Char('G') => self.chat_scroll = 0,
-            Key::Enter => self.typing = Some(Typing::Chat),
+            Key::Enter => match self.selected_login() {
+                Some(login) => self.activate(&login),
+                None if self.tab == Tab::Search => self.typing = Some(Typing::Search),
+                None => {}
+            },
             _ => {}
         }
     }
@@ -1028,11 +471,8 @@ impl App {
     fn on_typing_key(&mut self, typing: Typing, key: Key) {
         match (typing, &key) {
             (_, Key::Esc) => self.typing = None,
-            (Typing::Chat, Key::Enter) => self.send_chat(),
-            (Typing::Chat, Key::Up) => self.recall_history(true),
-            (Typing::Chat, Key::Down) => self.recall_history(false),
-            (Typing::Chat, Key::PageUp) => self.scroll_chat(10),
-            (Typing::Chat, Key::PageDown) => self.scroll_chat(-10),
+            #[cfg(target_os = "linux")]
+            (Typing::Chat, _) => self.on_chat_typing_key(key),
             (Typing::Search, Key::Enter) => {
                 self.run_search();
                 self.typing = None;
@@ -1041,9 +481,6 @@ impl App {
             (Typing::Search | Typing::Filter, Key::Up | Key::Down) => {
                 self.typing = None;
                 self.on_sidebar_key(key);
-            }
-            (Typing::Chat, _) => {
-                self.chat_input.handle(&key);
             }
             (Typing::Search, _) => {
                 if self.search.handle(&key) {

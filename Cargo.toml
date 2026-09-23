@@ -21,11 +21,15 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-audio.workspace = true
 term.workspace = true
 twitch-core.workspace = true
 twitch-auth.workspace = true
 twitch-channels.workspace = true
+
+# The player and the chat: Linux only. Elsewhere the app runs in
+# channels-only mode (login and channel lists).
+[target.'cfg(target_os = "linux")'.dependencies]
+audio.workspace = true
 twitch-chat.workspace = true
 twitch-playlist.workspace = true
 video.workspace = true

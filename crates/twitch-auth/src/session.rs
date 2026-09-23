@@ -79,12 +79,13 @@ pub fn logout(session: &Session) -> Result<(), String> {
 }
 
 pub fn path() -> PathBuf {
-    let base = std::env::var_os("XDG_STATE_HOME")
-        .map(PathBuf::from)
-        .filter(|p| p.is_absolute())
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")))
-        .unwrap_or_else(|| PathBuf::from("."));
-    base.join("twitch-tui").join("session")
+    let var = |name: &str| std::env::var_os(name).map(PathBuf::from).filter(|p| p.is_absolute());
+    let base = if cfg!(windows) {
+        var("LOCALAPPDATA")
+    } else {
+        var("XDG_STATE_HOME").or_else(|| var("HOME").map(|h| h.join(".local/state")))
+    };
+    base.unwrap_or_else(|| PathBuf::from(".")).join("twitch-tui").join("session")
 }
 
 /// The saved session, if any. A damaged file counts as none.
@@ -110,7 +111,6 @@ pub fn load() -> Option<Session> {
 /// one step so a crash never leaves half of it.
 pub fn save(session: &Session) -> Result<(), String> {
     use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
 
     let path = path();
     let dir = path.parent().ok_or("no directory for the session file")?;
@@ -121,12 +121,7 @@ pub fn save(session: &Session) -> Result<(), String> {
     );
     let tmp = path.with_extension("tmp");
     let _ = std::fs::remove_file(&tmp);
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&tmp)
-        .map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
+    let mut file = twitch_core::create_private(&tmp).map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
     file.write_all(text.as_bytes()).map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
     std::fs::rename(&tmp, &path).map_err(|e| format!("cannot write {}: {e}", path.display()))
 }

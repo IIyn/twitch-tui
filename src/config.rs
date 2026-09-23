@@ -4,8 +4,10 @@ use std::path::PathBuf;
 
 use twitch_auth::{cookies, session};
 use twitch_core::helix::Session;
+#[cfg(target_os = "linux")]
 use twitch_playlist::Quality;
 
+#[cfg(target_os = "linux")]
 use crate::viz::VizStyle;
 
 /// Where the website token came from, for display in the interface.
@@ -30,6 +32,7 @@ impl TokenSource {
 }
 
 /// How the picture is drawn.
+#[cfg(target_os = "linux")]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum VideoOutput {
     /// Real picture when the terminal supports it, else ASCII.
@@ -45,19 +48,24 @@ pub struct Config {
     /// The twitch.tv website's own token: optional, it only brings the
     /// account's subscriber perks to playback and lets follow be attempted.
     pub token: Option<String>,
-    /// Frames per second for the picture.
-    pub video_fps: u32,
-    pub video_output: VideoOutput,
-    pub video_quality: Quality,
     pub token_source: TokenSource,
+    /// Frames per second for the picture.
+    #[cfg(target_os = "linux")]
+    pub video_fps: u32,
+    #[cfg(target_os = "linux")]
+    pub video_output: VideoOutput,
+    #[cfg(target_os = "linux")]
+    pub video_quality: Quality,
+    #[cfg(target_os = "linux")]
     pub volume: u32,
+    #[cfg(target_os = "linux")]
     pub visualizer: VizStyle,
     pub autoplay: Option<String>,
     /// Only the channel lists: no playback nor chat.
     pub channels_only: bool,
 }
 
-const TEMPLATE: &str = "\
+const LOGIN_TEMPLATE: &str = "\
 # twitch-tui configuration
 #
 # Log in to your Twitch account (followed channels, chat) by running
@@ -77,7 +85,11 @@ const TEMPLATE: &str = "\
 # Token to use instead of the browser cookie (the `auth-token` cookie value).
 # Keep this file private.
 # token = your_auth_token
+";
 
+/// Settings of the player, which only exists on Linux.
+#[cfg(target_os = "linux")]
+const PLAYER_TEMPLATE: &str = "
 # Initial volume, 0-150.
 volume = 80
 
@@ -100,24 +112,25 @@ visualizer = spectrum
 ";
 
 pub fn path() -> PathBuf {
-    let base = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .filter(|p| p.is_absolute())
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
-        .unwrap_or_else(|| PathBuf::from("."));
-    base.join("twitch-tui").join("config")
+    let var = |name: &str| std::env::var_os(name).map(PathBuf::from).filter(|p| p.is_absolute());
+    let base = if cfg!(windows) {
+        var("APPDATA")
+    } else {
+        var("XDG_CONFIG_HOME").or_else(|| var("HOME").map(|h| h.join(".config")))
+    };
+    base.unwrap_or_else(|| PathBuf::from(".")).join("twitch-tui").join("config")
 }
 
 /// Writes the commented template on first run, readable by the user only.
 fn create_template(path: &std::path::Path) {
-    use std::os::unix::fs::OpenOptionsExt;
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    let file = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(path);
-    if let Ok(mut file) = file {
+    if let Ok(mut file) = twitch_core::create_private(path) {
         use std::io::Write;
-        let _ = file.write_all(TEMPLATE.as_bytes());
+        let _ = file.write_all(LOGIN_TEMPLATE.as_bytes());
+        #[cfg(target_os = "linux")]
+        let _ = file.write_all(PLAYER_TEMPLATE.as_bytes());
     }
 }
 
@@ -125,11 +138,16 @@ pub fn load(args: &[String]) -> Result<Config, String> {
     let mut config = Config {
         session: None,
         token: None,
-        video_fps: video::DEFAULT_FPS,
-        video_output: VideoOutput::Auto,
-        video_quality: Quality::Auto,
         token_source: TokenSource::None(String::new()),
+        #[cfg(target_os = "linux")]
+        video_fps: video::DEFAULT_FPS,
+        #[cfg(target_os = "linux")]
+        video_output: VideoOutput::Auto,
+        #[cfg(target_os = "linux")]
+        video_quality: Quality::Auto,
+        #[cfg(target_os = "linux")]
         volume: 80,
+        #[cfg(target_os = "linux")]
         visualizer: VizStyle::Bars,
         autoplay: None,
         channels_only: false,
@@ -152,12 +170,19 @@ pub fn load(args: &[String]) -> Result<Config, String> {
                 let value = value.trim().trim_matches('"');
                 match key.trim() {
                     "token" => config.token = Some(value.to_string()).filter(|v| !v.is_empty()),
+                    // Settings of the player, which does not exist here.
+                    #[cfg(not(target_os = "linux"))]
+                    "volume" | "visualizer" | "video_fps" | "video_output" | "video_quality" => {}
+                    #[cfg(target_os = "linux")]
                     "volume" => config.volume = value.parse().map_err(|_| format!("invalid volume: {value}"))?,
+                    #[cfg(target_os = "linux")]
                     "visualizer" => config.visualizer = parse_viz(value)?,
+                    #[cfg(target_os = "linux")]
                     "video_fps" => {
                         let fps: u32 = value.parse().map_err(|_| format!("invalid video_fps: {value}"))?;
                         config.video_fps = fps.clamp(5, 60);
                     }
+                    #[cfg(target_os = "linux")]
                     "video_output" => {
                         config.video_output = match value {
                             "auto" => VideoOutput::Auto,
@@ -166,6 +191,7 @@ pub fn load(args: &[String]) -> Result<Config, String> {
                             _ => return Err(format!("unknown video_output `{value}` (auto, ascii, graphics)")),
                         }
                     }
+                    #[cfg(target_os = "linux")]
                     "video_quality" => {
                         config.video_quality = Quality::parse(value).ok_or_else(|| {
                             format!("unknown video_quality `{value}` (auto, 360p, 720p, 1080p, source…)")
@@ -194,7 +220,13 @@ pub fn load(args: &[String]) -> Result<Config, String> {
         match arg.as_str() {
             "-v" | "--volume" => {
                 let v = iter.next().ok_or("--volume needs a value")?;
-                config.volume = v.parse().map_err(|_| format!("invalid volume: {v}"))?;
+                let volume: u32 = v.parse().map_err(|_| format!("invalid volume: {v}"))?;
+                #[cfg(target_os = "linux")]
+                {
+                    config.volume = volume.min(150);
+                }
+                #[cfg(not(target_os = "linux"))]
+                let _ = volume;
             }
             "--anonymous" => anonymous = true,
             "--channels-only" | "--compatibility" => config.channels_only = true,
@@ -210,7 +242,15 @@ pub fn load(args: &[String]) -> Result<Config, String> {
             }
         }
     }
-    config.volume = config.volume.min(150);
+    #[cfg(target_os = "linux")]
+    {
+        config.volume = config.volume.min(150);
+    }
+    // The player and the chat rely on Linux (audio players, shared memory,
+    // pipes handed to ffmpeg): elsewhere only the channel lists run.
+    if !cfg!(target_os = "linux") {
+        config.channels_only = true;
+    }
     if !anonymous {
         config.session = session::load();
     }
@@ -220,7 +260,10 @@ pub fn load(args: &[String]) -> Result<Config, String> {
         config.token = None;
         config.token_source = TokenSource::None("started with --anonymous".into());
     } else if config.token.is_none() {
-        if firefox_login {
+        if config.channels_only {
+            // Only playback and following use it.
+            config.token_source = TokenSource::None("not needed in channels-only mode".into());
+        } else if firefox_login {
             match cookies::find_token(firefox_profile.as_deref()) {
                 Ok(found) => {
                     config.token = Some(found.token);
@@ -243,6 +286,7 @@ fn expand_home(value: &str) -> PathBuf {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn parse_viz(value: &str) -> Result<VizStyle, String> {
     match value {
         "spectrum" | "bars" => Ok(VizStyle::Bars),

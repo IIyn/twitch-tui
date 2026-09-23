@@ -1,9 +1,11 @@
 mod app;
 mod config;
+#[cfg(target_os = "linux")]
 mod graphics;
 mod theme;
 mod ui;
 mod util;
+#[cfg(target_os = "linux")]
 mod viz;
 
 use std::io::Read;
@@ -12,37 +14,15 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use app::{ApiEvent, App};
-use audio::AudioEvent;
 use term::{Key, KeyParser, Screen};
-use twitch_chat::ChatEvent;
-use video::VideoEvent;
 
 const FRAME: Duration = Duration::from_millis(33);
 
 pub enum Event {
     Key(Key),
     Api(ApiEvent),
-    Chat(ChatEvent),
-    Audio(AudioEvent),
-    Video(VideoEvent),
-}
-
-impl From<ChatEvent> for Event {
-    fn from(e: ChatEvent) -> Event {
-        Event::Chat(e)
-    }
-}
-
-impl From<AudioEvent> for Event {
-    fn from(e: AudioEvent) -> Event {
-        Event::Audio(e)
-    }
-}
-
-impl From<VideoEvent> for Event {
-    fn from(e: VideoEvent) -> Event {
-        Event::Video(e)
-    }
+    #[cfg(target_os = "linux")]
+    Player(app::player::PlayerEvent),
 }
 
 fn main() {
@@ -100,13 +80,11 @@ fn login() -> i32 {
     let result = twitch_auth::session::login(|code| {
         println!("To log in, open this page and approve the code {}:", code.user_code);
         println!("  {}", code.verification_uri);
-        let graphical = ["DISPLAY", "WAYLAND_DISPLAY"].iter().any(|v| std::env::var_os(v).is_some());
+        // On Linux, only from a desktop session: over SSH there is no browser to open.
+        let graphical = !cfg!(target_os = "linux")
+            || ["DISPLAY", "WAYLAND_DISPLAY"].iter().any(|v| std::env::var_os(v).is_some());
         if graphical {
-            let _ = std::process::Command::new("xdg-open")
-                .arg(&code.verification_uri)
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn();
+            let _ = util::open_url(&code.verification_uri);
         }
         println!("Waiting for approval…");
     });
@@ -171,8 +149,9 @@ fn check_login(config: &config::Config) {
 }
 
 fn in_path(bin: &str) -> bool {
+    let file = if cfg!(windows) { format!("{bin}.exe") } else { bin.to_string() };
     std::env::var_os("PATH")
-        .map(|p| std::env::split_paths(&p).any(|dir| dir.join(bin).is_file()))
+        .map(|p| std::env::split_paths(&p).any(|dir| dir.join(&file).is_file()))
         .unwrap_or(false)
 }
 
@@ -202,6 +181,7 @@ fn run(config: &config::Config) {
 
     let mut app = App::new(config, tx);
     let mut screen = Screen::new();
+    #[cfg(target_os = "linux")]
     let mut graphics = graphics::Graphics::default();
     let mut out = std::io::stdout();
     let mut frame: u64 = 0;
@@ -227,26 +207,35 @@ fn run(config: &config::Config) {
         }
 
         let now = Instant::now();
+        #[cfg(target_os = "linux")]
         let dt = (now - last).as_secs_f32().min(0.1);
         last = now;
         frame += 1;
 
         let (w, h) = term::size();
+        app.tick();
+        #[cfg(target_os = "linux")]
         let layout = ui::Layout::compute(w, h, &app);
-        app.tick(dt, layout.viz_size());
+        #[cfg(target_os = "linux")]
+        app.tick_player(dt, layout.viz_size());
         screen.begin(w, h, theme::base());
         ui::draw(&mut screen, &app, frame);
         if screen.flush(&mut out).is_err() {
             screen.invalidate();
+            #[cfg(target_os = "linux")]
             graphics.forget();
         }
-        let shown = match layout.picture(&app, (w, h)) {
-            Some(r) => graphics.show(&mut out, &app.video, r),
-            None => graphics.hide(&mut out),
-        };
-        if shown.is_err() {
-            graphics.forget();
+        #[cfg(target_os = "linux")]
+        {
+            let shown = match layout.picture(&app, (w, h)) {
+                Some(r) => graphics.show(&mut out, &app.player.video, r),
+                None => graphics.hide(&mut out),
+            };
+            if shown.is_err() {
+                graphics.forget();
+            }
         }
     }
-    app.audio.stop();
+    #[cfg(target_os = "linux")]
+    app.player.audio.stop();
 }

@@ -1,7 +1,10 @@
 //! Formatting and time helpers.
 
+// Local time, for the chat's timestamps.
+#[cfg(target_os = "linux")]
 use std::os::raw::{c_char, c_int, c_long};
 
+#[cfg(target_os = "linux")]
 #[repr(C)]
 struct Tm {
     tm_sec: c_int,
@@ -17,17 +20,35 @@ struct Tm {
     tm_zone: *const c_char,
 }
 
+#[cfg(target_os = "linux")]
 unsafe extern "C" {
     fn localtime_r(time: *const i64, result: *mut Tm) -> *mut Tm;
 }
 
 /// `HH:MM` in the local timezone.
+#[cfg(target_os = "linux")]
 pub fn local_hm(ts: i64) -> String {
     let mut tm = unsafe { std::mem::zeroed::<Tm>() };
     if unsafe { localtime_r(&ts, &mut tm) }.is_null() {
         return "--:--".into();
     }
     format!("{:02}:{:02}", tm.tm_hour, tm.tm_min)
+}
+
+/// Opens a web page in the default browser.
+pub fn open_url(url: &str) -> std::io::Result<()> {
+    use std::process::{Command, Stdio};
+    let mut command = if cfg!(windows) {
+        // Rather than through cmd, which would split the URL on `&`.
+        let mut c = Command::new("rundll32");
+        c.arg("url.dll,FileProtocolHandler");
+        c
+    } else if cfg!(target_os = "macos") {
+        Command::new("open")
+    } else {
+        Command::new("xdg-open")
+    };
+    command.arg(url).stdout(Stdio::null()).stderr(Stdio::null()).spawn().map(|_| ())
 }
 
 /// Parses `YYYY-MM-DDTHH:MM:SS(.fff)Z` into a unix timestamp.
@@ -63,6 +84,7 @@ fn trim_decimal(v: f64, suffix: &str) -> String {
 }
 
 /// 12,345
+#[cfg(target_os = "linux")]
 pub fn grouped(n: u64) -> String {
     let digits = n.to_string();
     let mut out = String::new();
@@ -76,6 +98,7 @@ pub fn grouped(n: u64) -> String {
 }
 
 /// 3:04:05 or 4:05
+#[cfg(target_os = "linux")]
 pub fn duration(secs: i64) -> String {
     let secs = secs.max(0);
     let (h, m, s) = (secs / 3600, secs / 60 % 60, secs % 60);
@@ -101,8 +124,13 @@ mod tests {
         assert_eq!(short_duration(59), "0m");
         assert_eq!(short_duration(12 * 60 + 5), "12m");
         assert_eq!(short_duration(3600 + 5 * 60), "1h05");
+        assert_eq!(parse_iso8601("2023-11-14T22:13:20Z"), Some(1_700_000_000));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn formats_player_values() {
         assert_eq!(grouped(1_234_567), "1,234,567");
         assert_eq!(duration(3 * 3600 + 4 * 60 + 5), "3:04:05");
-        assert_eq!(parse_iso8601("2023-11-14T22:13:20Z"), Some(1_700_000_000));
     }
 }

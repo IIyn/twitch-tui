@@ -1,80 +1,31 @@
-//! Terminal handling without external crates: raw mode through libc FFI,
-//! a double-buffered cell grid with diffed truecolor output, and key parsing.
+//! Terminal handling without external crates: raw mode through the system's
+//! own calls (libc on Linux and macOS, kernel32 on Windows), a
+//! double-buffered cell grid with diffed truecolor output, and key parsing.
 
 pub mod line_edit;
 
 use std::io::{self, Write};
-use std::os::raw::{c_int, c_ulong};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 // ---------------------------------------------------------------- raw mode
 
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct Termios {
-    c_iflag: u32,
-    c_oflag: u32,
-    c_cflag: u32,
-    c_lflag: u32,
-    c_line: u8,
-    c_cc: [u8; 32],
-    c_ispeed: u32,
-    c_ospeed: u32,
-}
+#[cfg(unix)]
+mod unix;
+#[cfg(unix)]
+use unix as sys;
+#[cfg(windows)]
+mod windows;
+#[cfg(windows)]
+use windows as sys;
 
-#[repr(C)]
-#[derive(Default)]
-struct Winsize {
-    ws_row: u16,
-    ws_col: u16,
-    ws_xpixel: u16,
-    ws_ypixel: u16,
-}
+pub use sys::{cell_pixels, size};
 
-#[repr(C)]
-struct SigAction {
-    handler: usize,
-    mask: [u64; 16],
-    flags: c_int,
-    restorer: usize,
-}
-
-unsafe extern "C" {
-    fn sigaction(signal: c_int, action: *const SigAction, old: *mut SigAction) -> c_int;
-    fn tcgetattr(fd: c_int, termios: *mut Termios) -> c_int;
-    fn tcsetattr(fd: c_int, action: c_int, termios: *const Termios) -> c_int;
-    fn cfmakeraw(termios: *mut Termios);
-    fn ioctl(fd: c_int, request: c_ulong, ...) -> c_int;
-}
-
-const TCSANOW: c_int = 0;
-const TIOCGWINSZ: c_ulong = 0x5413;
-const VTIME: usize = 5;
-const VMIN: usize = 6;
-
-static ORIGINAL: Mutex<Option<Termios>> = Mutex::new(None);
 static QUIT: AtomicBool = AtomicBool::new(false);
-
-const SIGHUP: c_int = 1;
-const SIGTERM: c_int = 15;
-
-extern "C" fn on_signal(_signal: c_int) {
-    QUIT.store(true, Ordering::SeqCst);
-}
 
 /// Asks for a clean exit when the session goes away (`kill`, window closed),
 /// so the terminal is restored and the decoders are stopped.
 pub fn catch_termination() {
-    let action = SigAction {
-        handler: on_signal as extern "C" fn(c_int) as usize,
-        mask: [0; 16],
-        flags: 0,
-        restorer: 0,
-    };
-    for signal in [SIGHUP, SIGTERM] {
-        unsafe { sigaction(signal, &action, std::ptr::null_mut()) };
-    }
+    sys::catch_termination();
 }
 
 /// True once a termination signal has been received.
@@ -86,47 +37,18 @@ const ENTER_SEQ: &str = "\x1b[?1049h\x1b[?25l\x1b[?2004h\x1b[H\x1b[2J";
 const LEAVE_SEQ: &str = "\x1b[0m\x1b[?2004l\x1b[?25h\x1b[?1049l";
 
 pub fn enter() -> io::Result<()> {
-    let mut termios = unsafe { std::mem::zeroed::<Termios>() };
-    if unsafe { tcgetattr(0, &mut termios) } != 0 {
-        return Err(io::Error::other("stdin is not a terminal"));
-    }
-    *ORIGINAL.lock().unwrap() = Some(termios);
-    let mut raw = termios;
-    unsafe { cfmakeraw(&mut raw) };
-    // Reads return after 100ms even without input so a lone Esc is detected.
-    raw.c_cc[VMIN] = 0;
-    raw.c_cc[VTIME] = 1;
-    unsafe { tcsetattr(0, TCSANOW, &raw) };
-
+    sys::enter_raw()?;
     let mut out = io::stdout();
     out.write_all(ENTER_SEQ.as_bytes())?;
     out.flush()
 }
 
 pub fn leave() {
-    if let Some(original) = ORIGINAL.lock().map(|mut o| o.take()).ok().flatten() {
-        unsafe { tcsetattr(0, TCSANOW, &original) };
+    if sys::leave_raw() {
         let mut out = io::stdout();
         let _ = out.write_all(LEAVE_SEQ.as_bytes());
         let _ = out.flush();
     }
-}
-
-pub fn size() -> (u16, u16) {
-    let mut ws = Winsize::default();
-    if unsafe { ioctl(1, TIOCGWINSZ, &mut ws) } == 0 && ws.ws_col > 0 {
-        (ws.ws_col, ws.ws_row)
-    } else {
-        (80, 24)
-    }
-}
-
-/// Size of one cell in pixels, when the terminal reports it.
-pub fn cell_pixels() -> Option<(u16, u16)> {
-    let mut ws = Winsize::default();
-    let ok = unsafe { ioctl(1, TIOCGWINSZ, &mut ws) } == 0;
-    (ok && ws.ws_col > 0 && ws.ws_row > 0 && ws.ws_xpixel > 0 && ws.ws_ypixel > 0)
-        .then(|| (ws.ws_xpixel / ws.ws_col, ws.ws_ypixel / ws.ws_row))
 }
 
 // ---------------------------------------------------------------- colors & cells
