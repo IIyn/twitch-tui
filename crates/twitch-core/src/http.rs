@@ -36,8 +36,12 @@ pub fn request(url: &str, headers: &[(&str, &str)], body: Option<&str>) -> Resul
         config.push_str(&format!("data-binary = {}\n", config_quote(body)));
     }
 
-    let mut child = Command::new("curl")
-        .args(["-sS", "--compressed", "--max-time", "15", "-w", "\n%{http_code}", "-K", "-"])
+    let mut command = Command::new("curl");
+    // The curl shipped with Windows is built without compression.
+    #[cfg(not(windows))]
+    command.arg("--compressed");
+    let mut child = command
+        .args(["-sS", "--max-time", "15", "-w", "\n%{http_code}", "-K", "-"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

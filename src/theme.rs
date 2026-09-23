@@ -15,6 +15,7 @@ pub const LIVE: Rgb = Rgb(235, 4, 0);
 pub const PINK: Rgb = Rgb(255, 92, 170);
 pub const GREEN: Rgb = Rgb(0, 214, 143);
 pub const YELLOW: Rgb = Rgb(255, 196, 107);
+#[cfg(target_os = "linux")]
 pub const CYAN: Rgb = Rgb(94, 224, 255);
 
 const STOPS: [Rgb; 5] = [
@@ -41,12 +42,14 @@ pub fn panel() -> Style {
 }
 
 /// Makes a user-chosen chat color readable on the dark background.
+#[cfg(target_os = "linux")]
 pub fn readable(c: Rgb) -> Rgb {
     let luma = 0.299 * c.0 as f32 + 0.587 * c.1 as f32 + 0.114 * c.2 as f32;
     if luma < 90.0 { c.lerp(Rgb(255, 255, 255), (90.0 - luma) / 160.0 + 0.2) } else { c }
 }
 
 /// Stable fallback color for users without a chat color.
+#[cfg(target_os = "linux")]
 pub fn name_color(name: &str) -> Rgb {
     const COLORS: [Rgb; 8] = [
         Rgb(255, 127, 80),
