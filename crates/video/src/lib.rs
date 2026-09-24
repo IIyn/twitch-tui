@@ -231,21 +231,30 @@ impl Drop for Video {
 fn spawn(url: &str, target: Target, fps: u32, [r, g, b]: [u8; 3]) -> Result<(Child, ChildStdout, PipeReader), String> {
     let (width, height) = (target.width, target.height);
     // Fit the picture inside the panel and pad the rest, so every frame has
-    // exactly the same size and the aspect ratio survives. Both outputs are
-    // made to start at time zero of the input (padding with repeated frames
-    // or silence) so frame `n` is due when the sound reaches `n / fps`.
+    // exactly the same size and the aspect ratio survives.
     let filter = format!(
-        "fps=fps={fps}:start_time=0,scale={width}:{height}:force_original_aspect_ratio=decrease,\
+        "scale={width}:{height}:force_original_aspect_ratio=decrease,\
          pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=0x{r:02x}{g:02x}{b:02x}"
     );
+    let rate = fps.to_string();
     let (pcm, pcm_writer) = io::pipe().map_err(|e| format!("cannot create audio pipe: {e}"))?;
     let pcm_fd = pcm_writer.as_raw_fd();
     let mut command = Command::new("ffmpeg");
     command
         .args(["-nostdin", "-hide_banner", "-loglevel", "error"])
         .args(["-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "4"])
+        // Read at the pace of playback, a second ahead. Held back by the
+        // audio player instead, ffmpeg starves its sound output for a
+        // fraction of a second at every segment of the live stream.
+        .args(["-readrate", "1", "-readrate_initial_burst", "1"])
         .args(["-i", url])
-        .args(["-map", "0:v:0", "-vf", &filter, "-pix_fmt", "rgb24", "-f", "rawvideo", "pipe:1"])
+        .args(["-map", "0:v:0", "-vf", &filter])
+        // A constant rate, and the sound made to start at time zero too, so
+        // frame `n` is due when the sound reaches `n / fps`. Not the `fps`
+        // filter: next to the sound output, it holds ffmpeg to about half
+        // speed at the live edge.
+        .args(["-fps_mode", "cfr", "-r", &rate])
+        .args(["-pix_fmt", "rgb24", "-f", "rawvideo", "pipe:1"])
         .args(["-map", "0:a:0", "-af", "aresample=async=1:first_pts=0"])
         .args(audio::PCM_ARGS)
         .arg(format!("pipe:{pcm_fd}"))
